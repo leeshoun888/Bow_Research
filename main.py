@@ -573,6 +573,82 @@ def compute_string_angle(
     return abs(angle_deg)
 
 
+def _estimate_force_from_energy(
+    draw_m_values: np.ndarray,
+    stored_energy_j: np.ndarray,
+    window: int = 13,
+    poly_order: int = 3,
+) -> np.ndarray:
+    """
+    Estimate F(draw)=dU/dx with a local polynomial derivative to suppress
+    numerical jitter from finite-difference on discretely solved energy states.
+    """
+    n = len(draw_m_values)
+    if n < 3:
+        return np.zeros(n)
+    
+    if n < 7:
+        force = np.gradient(stored_energy_j, draw_m_values)
+        return np.maximum(force, 0.0)
+    
+    if window % 2 == 0:
+        window += 1
+    if window >= n:
+        window = n - 1 if n % 2 == 0 else n
+    if window < 5:
+        window = 5
+    if window % 2 == 0:
+        window += 1
+    
+    half = window // 2
+    force_n = np.zeros(n, dtype=float)
+    
+    for i in range(n):
+        left = max(0, i - half)
+        right = min(n, i + half + 1)
+        
+        # Keep near-constant window size at boundaries.
+        if right - left < window:
+            if left == 0:
+                right = min(n, window)
+            elif right == n:
+                left = max(0, n - window)
+        
+        xw = draw_m_values[left:right] - draw_m_values[i]
+        yw = stored_energy_j[left:right]
+        
+        deg = min(poly_order, len(xw) - 1)
+        if deg < 1:
+            force_n[i] = 0.0
+            continue
+        
+        # Gaussian weights: emphasize local neighborhood.
+        span = max(float(np.max(np.abs(xw))), 1e-12)
+        sigma = max(span * 0.6, 1e-12)
+        w = np.exp(-0.5 * (xw / sigma) ** 2)
+        
+        # Weighted least-squares polynomial in shifted coordinate xw.
+        # U(x) ≈ a0 + a1 x + a2 x² + ... -> dU/dx at center is a1.
+        A = np.vstack([xw ** k for k in range(deg + 1)]).T
+        Aw = A * w[:, None]
+        bw = yw * w
+        coeffs, *_ = np.linalg.lstsq(Aw, bw, rcond=None)
+        force_n[i] = coeffs[1]
+    
+    force_n = np.maximum(force_n, 0.0)
+    
+    # Physical monotonicity (draw force should not decrease with draw).
+    force_n = np.maximum.accumulate(force_n)
+    
+    # Energy consistency: rescale so ∫F dx matches terminal stored energy.
+    end_energy = float(stored_energy_j[-1])
+    force_area = float(np.trapezoid(force_n, draw_m_values))
+    if force_area > 1e-12 and end_energy > 0:
+        force_n *= end_energy / force_area
+    
+    return force_n
+
+
 def compute_geometric_fdc(
     measurements: List[MeasurementPoint],
     limb_length_cm: float,
@@ -676,12 +752,8 @@ def compute_geometric_fdc(
     # Numerical safety: enforce non-decreasing stored energy with draw.
     stored_energy = np.maximum.accumulate(stored_energy)
     
-    # Draw force from energy gradient.
-    if len(draw_m_values) >= 3:
-        force_n = np.gradient(stored_energy, draw_m_values, edge_order=2)
-    else:
-        force_n = np.gradient(stored_energy, draw_m_values)
-    force_n = np.maximum(force_n, 0.0)
+    # Draw force from smoothed local derivative of stored energy.
+    force_n = _estimate_force_from_energy(draw_m_values, stored_energy)
     
     fdc_points: List[ForceCurvePoint] = []
     for i, draw_inch in enumerate(draw_inches):
@@ -1573,7 +1645,6 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
     
     draws = [p.draw_inch for p in fdc]
     forces = [p.force_lbs for p in fdc]
-    energies = [p.stored_energy_j for p in fdc]
     
     fig = go.Figure()
     
@@ -1586,16 +1657,6 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         line=dict(color='#00d4ff', width=3),
         fill='tozeroy',
         fillcolor='rgba(0, 212, 255, 0.15)',
-    ))
-    
-    # Stored energy curve (secondary axis) to keep FDC and energy consistent visually.
-    fig.add_trace(go.Scatter(
-        x=draws,
-        y=energies,
-        mode='lines',
-        name='저장 에너지',
-        line=dict(color='#ffd700', width=2, dash='dot'),
-        yaxis='y2',
     ))
     
     # Highlight 28" point
@@ -1632,14 +1693,49 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
             bordercolor='#2a3f5f',
             borderwidth=1
         ),
-        yaxis2=dict(
-            title="저장 에너지 (J)",
-            overlaying='y',
-            side='right',
-            showgrid=False,
-            color='#ffd700',
-        ),
         height=500,
+    )
+    
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor='#2a3f5f',
+        gridwidth=1,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor='#2a3f5f',
+        gridwidth=1,
+    )
+    
+    return fig
+
+
+def create_energy_storage_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
+    """Create stored energy vs draw chart (separate axis from FDC)."""
+    draws = [p.draw_inch for p in fdc]
+    energies = [p.stored_energy_j for p in fdc]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=draws,
+        y=energies,
+        mode='lines',
+        name='저장 에너지 U(d)',
+        line=dict(color='#ffd700', width=3),
+        fill='tozeroy',
+        fillcolor='rgba(255, 215, 0, 0.12)',
+    ))
+    
+    fig.update_layout(
+        title="저장 에너지 곡선 U(d)",
+        xaxis_title="드로우 길이 (인치)",
+        yaxis_title="저장 에너지 (J)",
+        template="plotly_dark",
+        paper_bgcolor='#0d111f',
+        plot_bgcolor='#1a1f3a',
+        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        height=300,
+        showlegend=False,
     )
     
     fig.update_xaxes(
@@ -2852,6 +2948,10 @@ def main() -> None:
     with col2:
         fig_angle = create_string_angle_chart(fdc)
         st.plotly_chart(fig_angle, use_container_width=True)
+        fig_energy = create_energy_storage_chart(fdc)
+        st.plotly_chart(fig_energy, use_container_width=True)
+    
+    st.caption("참고: FDC(장력)와 저장 에너지(U)는 물리량 단위가 다르므로 별도 그래프로 분리 표시됩니다.")
     
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
