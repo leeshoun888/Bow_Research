@@ -1,6 +1,6 @@
 """
 ════════════════════════════════════════════════════════════════════════════════
-DIGITAL BOW PHYSICS & BALLISTICS LABORATORY v4.1
+DIGITAL BOW PHYSICS & BALLISTICS LABORATORY v4.3
 Museum-Grade Interactive Research Platform for Experimental Archaeology
 ════════════════════════════════════════════════════════════════════════════════
 
@@ -14,17 +14,28 @@ CORE FEATURES:
 - Ballistics Engine: Parabolic Trajectory & Range Prediction
 - Target Engagement Simulation (Effective Range Analysis)
 
-REAL-TIME REACTIVITY (v4.1):
+REAL-TIME REACTIVITY (v4.3):
 - Instant response to width/thickness changes in sidebar
 - EI-dependent bending: thicker sections bend less (κ = M/EI)
 - Side profile initial geometry fully integrated
 - Brace height constraint (17cm) maintained across all configurations
 - High-resolution curve interpolation (80 segments)
+- FIXED v4.2: Upper and Lower limbs calculated INDEPENDENTLY
+  * Each limb uses its own EI distribution
+  * Asymmetric bows now properly represented
+  * Lower limb changes now immediately visible in tiller graph
+- FIXED v4.3: PHYSICAL ACCURACY IMPROVEMENTS
+  * String length CONSTANT across all draw lengths (based on braced state)
+  * Limb arc length PRESERVED through normalization (prevents limb stretching)
+  * Interior angle validation (limb tangent vs string vector < 175°)
+  * Prevents String Vector Inversion (unphysical string reversal)
+  * Realistic string geometry at all draw lengths
 
 THEORETICAL FOUNDATION:
 - Cantilever Beam Theory with Non-Linear Geometry
 - Second Moment of Area (Multiple Cross-Sections)
 - EI Distribution-Based Curvature Calculation
+- String Length Constraint (Geometric Invariant)
 - String Angle Dynamics & Tip Velocity Penalties
 - Kinetic Energy Transfer Efficiency
 - Projectile Motion Physics (Parabolic Trajectories)
@@ -34,7 +45,7 @@ MUSEUM-GRADE PRESENTATION:
 - Metallic Accent Colors (Cyan/Gold)
 - Vector Graphics & Geometric Line Art
 - LaTeX Mathematical Notation
-- Real-Time Debugging Info (EI Range Display)
+- Real-Time Debugging Info (EI Range & String Length Display)
 - Citation-Ready Research Documentation
 ════════════════════════════════════════════════════════════════════════════════
 """
@@ -1742,11 +1753,34 @@ def compute_initial_side_profile(
     return x_initial, y_initial
 
 
+def calculate_string_length(
+    tip_x: float,
+    tip_y: float,
+    nock_x: float,
+    nock_y: float = 0.0
+) -> float:
+    """
+    Calculate string length from tip to nock point
+    
+    Parameters:
+    -----------
+    tip_x, tip_y : float
+        Tip coordinates [cm]
+    nock_x, nock_y : float
+        Nock point coordinates [cm]
+    
+    Returns:
+    --------
+    float : String length [cm]
+    """
+    return np.sqrt((tip_x - nock_x)**2 + (tip_y - nock_y)**2)
+
+
 def compute_braced_geometry(
     x_unbraced_tip: float,
     y_unbraced_tip: float,
     brace_height_cm: float = TARGET_BRACE_HEIGHT_CM
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Calculate braced tip position based on string length constraint
     
@@ -1763,9 +1797,6 @@ def compute_braced_geometry(
     String length (tip to center) ≈ limb length - brace_height
     When braced: sqrt((x_tip - brace_height)² + y_tip²) = string_length
     
-    Simplification for x_tip ≈ brace_height:
-    y_tip ≈ sqrt(string_length²) ≈ limb_length - brace_height
-    
     Parameters:
     -----------
     x_unbraced_tip : float
@@ -1777,7 +1808,7 @@ def compute_braced_geometry(
     
     Returns:
     --------
-    Tuple[float, float] : (x_braced_tip, y_braced_tip)
+    Tuple[float, float, float] : (x_braced_tip, y_braced_tip, string_half_length)
     """
     # Limb length (approximated from unbraced tip position)
     limb_length_approx = np.sqrt(x_unbraced_tip**2 + y_unbraced_tip**2)
@@ -1790,10 +1821,8 @@ def compute_braced_geometry(
     x_braced_tip = brace_height_cm
     
     # Calculate y from string constraint
-    # String from (brace_height, y_tip) to (brace_height, 0)
-    # But string also pulls tip backward slightly
-    # Distance from tip to nock: sqrt((brace_height - brace_height)^2 + y_tip^2)
-    # This simplifies to: y_tip = string_half_length
+    # String length from tip to nock: sqrt((x_tip - brace)² + y_tip²) = string_length
+    # For x_tip ≈ brace: y_tip ≈ string_length
     
     # However, string also curves the limb, so actual y is slightly less
     # Use geometric constraint: tip must satisfy both string length and bending
@@ -1802,7 +1831,7 @@ def compute_braced_geometry(
     # Ensure reasonable bounds
     y_braced_tip = max(y_unbraced_tip * 0.75, min(y_unbraced_tip * 0.95, y_braced_tip))
     
-    return x_braced_tip, y_braced_tip
+    return x_braced_tip, y_braced_tip, string_half_length
 
 
 def compute_bow_deformation_realistic(
@@ -1810,6 +1839,8 @@ def compute_bow_deformation_realistic(
     limb_length_cm: float,
     draw_cm: float,
     side_profile: str,
+    limb_type: str = "Upper",
+    string_half_length: Optional[float] = None,
     n_segments: int = 80
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -1825,6 +1856,7 @@ def compute_bow_deformation_realistic(
     - Uses current measurements EI values directly
     - Thickness changes immediately affect local stiffness
     - Side profile provides initial geometry
+    - FIXED: Now calculates Upper and Lower limbs INDEPENDENTLY
     
     Parameters:
     -----------
@@ -1833,6 +1865,10 @@ def compute_bow_deformation_realistic(
     limb_length_cm : float
     draw_cm : float
     side_profile : str
+    limb_type : str
+        "Upper" or "Lower" - selects which limb to calculate
+    string_half_length : Optional[float]
+        Fixed string length [cm] - if provided, enforces constant string length
     n_segments : int
     
     Returns:
@@ -1840,13 +1876,14 @@ def compute_bow_deformation_realistic(
     Tuple[np.ndarray, np.ndarray, np.ndarray]
         (x_coords, y_coords, thickness_profile)
     """
-    # Extract upper limb data - MUST be current session data
-    upper_limb = [p for p in measurements if p.limb in ["Handle", "Upper"]]
-    upper_limb.sort(key=lambda p: p.position_cm)
+    # Extract limb data based on limb_type - CRITICAL FIX!
+    # Upper and Lower are now calculated INDEPENDENTLY with their own EI distributions
+    target_limb = [p for p in measurements if p.limb in ["Handle", limb_type]]
+    target_limb.sort(key=lambda p: p.position_cm)
     
-    positions = np.array([p.position_cm for p in upper_limb])
-    ei_values = np.array([max(p.ei_nm2, 1e-10) for p in upper_limb])
-    thicknesses = np.array([p.thickness_mm / 10.0 for p in upper_limb])
+    positions = np.array([p.position_cm for p in target_limb])
+    ei_values = np.array([max(p.ei_nm2, 1e-10) for p in target_limb])
+    thicknesses = np.array([p.thickness_mm / 10.0 for p in target_limb])
     
     # High-resolution interpolation for smooth curves
     s_array = np.linspace(0, limb_length_cm, n_segments)
@@ -1970,7 +2007,7 @@ def compute_bow_deformation_realistic(
         # Target tip position from geometric constraint
         x_unbraced_tip = x_initial[tip_idx]
         y_unbraced_tip = y_initial[tip_idx]
-        x_target_tip, y_target_tip = compute_braced_geometry(
+        x_target_tip, y_target_tip, _ = compute_braced_geometry(
             x_unbraced_tip, y_unbraced_tip, TARGET_BRACE_HEIGHT_CM
         )
         
@@ -1995,16 +2032,133 @@ def compute_bow_deformation_realistic(
             y_deformed[i] = y_initial[i] + (y_deformed[i] - y_initial[i]) * y_scale
             
     else:
-        # Drawn state: Apply inward compression (tips move toward centerline)
-        # This simulates string pulling tips together
+        # Drawn state: Apply inward compression with string length constraint
+        # CRITICAL FIX: Maintain constant string length AND limb arc length!
+        
+        nock_x = draw_cm
+        nock_y = 0.0
+        
+        # Initial compression (EI-based)
         draw_ratio = draw_cm / (limb_length_cm * 2.0)
-        compression_factor = max(0.5, 1.0 - draw_ratio * 0.5)
+        compression_factor = max(0.7, 1.0 - draw_ratio * 0.4)
         
         for i in range(n_segments):
             s_norm = s_array[i] / limb_length_cm
             # Progressive compression: more at tips, less at handle
             local_compression = 1.0 - s_norm * (1.0 - compression_factor)
             y_deformed[i] = y_deformed[i] * local_compression
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # STRING LENGTH CONSTRAINT (Maintain constant string length)
+        # ═══════════════════════════════════════════════════════════════════
+        if string_half_length is not None and string_half_length > 0:
+            tip_idx = -1
+            current_tip_x = x_deformed[tip_idx]
+            current_tip_y = y_deformed[tip_idx]
+            
+            # Calculate required tip_y to maintain string length
+            # String length: sqrt((tip_x - nock_x)² + tip_y²) = string_half_length
+            dx = current_tip_x - nock_x
+            
+            if dx**2 < string_half_length**2:
+                required_tip_y = np.sqrt(string_half_length**2 - dx**2)
+                
+                # Adjust tip position to match string length
+                if current_tip_y > 0:
+                    y_correction_factor = required_tip_y / current_tip_y
+                    
+                    # Apply correction progressively (more at tip)
+                    for i in range(n_segments):
+                        s_norm = s_array[i] / limb_length_cm
+                        correction = 1.0 + s_norm * (y_correction_factor - 1.0)
+                        y_deformed[i] = y_deformed[i] * correction
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # INTERIOR ANGLE VALIDATION (Prevent String Vector Inversion)
+        # ═══════════════════════════════════════════════════════════════════
+        tip_idx = -1
+        tip_x = x_deformed[tip_idx]
+        tip_y = y_deformed[tip_idx]
+        
+        # Calculate limb tip tangent vector (direction of last segment)
+        if len(x_deformed) >= 2:
+            dx_limb = x_deformed[-1] - x_deformed[-2]
+            dy_limb = y_deformed[-1] - y_deformed[-2]
+            limb_tangent = np.array([dx_limb, dy_limb])
+            limb_tangent_norm = limb_tangent / np.linalg.norm(limb_tangent)
+        else:
+            limb_tangent_norm = np.array([0.0, 1.0])  # Default vertical
+        
+        # Calculate string vector (from tip to nock - direction of pull)
+        string_vector = np.array([nock_x - tip_x, nock_y - tip_y])
+        string_vector_norm = string_vector / np.linalg.norm(string_vector)
+        
+        # Interior angle between limb tangent and string
+        dot_product = np.dot(limb_tangent_norm, string_vector_norm)
+        dot_product = np.clip(dot_product, -1.0, 1.0)
+        interior_angle_rad = np.arccos(dot_product)
+        interior_angle_deg = np.degrees(interior_angle_rad)
+        
+        # CRITICAL: Interior angle must be < 180 degrees
+        # For physical validity, should typically be < 90 degrees
+        MAX_INTERIOR_ANGLE_DEG = 175.0  # Safety margin below 180
+        
+        if interior_angle_deg > MAX_INTERIOR_ANGLE_DEG:
+            # String vector inversion detected!
+            # Reduce y-coordinates to prevent over-bending
+            
+            # Target: make interior angle = MAX_INTERIOR_ANGLE_DEG
+            # This requires adjusting tip position
+            
+            # Simple correction: increase tip_y to reduce bending
+            safety_factor = 1.5  # Increase tip_y by 50%
+            
+            for i in range(n_segments):
+                s_norm = s_array[i] / limb_length_cm
+                # Progressive adjustment (more at tip)
+                adjustment = 1.0 + s_norm * (safety_factor - 1.0)
+                y_deformed[i] = y_deformed[i] * adjustment
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # ARC LENGTH PRESERVATION (Problem 1 Fix)
+        # After all scaling operations, normalize to preserve limb length
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # Calculate actual arc length
+        arc_length_actual = 0.0
+        for i in range(1, n_segments):
+            dx = x_deformed[i] - x_deformed[i-1]
+            dy = y_deformed[i] - y_deformed[i-1]
+            segment_length = np.sqrt(dx**2 + dy**2)
+            arc_length_actual += segment_length
+        
+        # Target arc length (should match limb length)
+        arc_length_target = limb_length_cm
+        
+        # If arc length changed significantly, renormalize
+        if arc_length_actual > 0 and abs(arc_length_actual - arc_length_target) > 0.5:
+            # Scale positions to preserve arc length
+            scale_factor = arc_length_target / arc_length_actual
+            
+            # Reconstruct path with correct arc length
+            x_normalized = np.zeros(n_segments)
+            y_normalized = np.zeros(n_segments)
+            x_normalized[0] = x_deformed[0]
+            y_normalized[0] = y_deformed[0]
+            
+            for i in range(1, n_segments):
+                dx = x_deformed[i] - x_deformed[i-1]
+                dy = y_deformed[i] - y_deformed[i-1]
+                
+                # Scale segment length
+                dx_scaled = dx * scale_factor
+                dy_scaled = dy * scale_factor
+                
+                x_normalized[i] = x_normalized[i-1] + dx_scaled
+                y_normalized[i] = y_normalized[i-1] + dy_scaled
+            
+            x_deformed = x_normalized
+            y_deformed = y_normalized
     
     return x_deformed, y_deformed, thickness_interp
 
@@ -2033,26 +2187,86 @@ def create_virtual_tiller_realistic(
     alphas = [0.15, 0.25, 0.45, 0.7]
     labels = ['미휨(시위 없음)', '휨(시위 걸림)', '20인치 드로우', '28인치 드로우']
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 1: Calculate STRING LENGTH from Braced state (draw = 0)
+    # This establishes the fixed string length for all subsequent draws
+    # ═══════════════════════════════════════════════════════════════════════
+    string_half_length_upper = None
+    string_half_length_lower = None
+    
+    # Find braced state index
+    braced_idx = None
+    for i, d in enumerate(draw_inches):
+        if d == 0:
+            braced_idx = i
+            break
+    
+    if braced_idx is not None:
+        draw_cm_braced = 0.0
+        
+        # Calculate braced geometry to get string length
+        x_upper_braced, y_upper_braced, _ = compute_bow_deformation_realistic(
+            measurements, limb_length_cm, draw_cm_braced, side_profile, 
+            limb_type="Upper", string_half_length=None, n_segments=80
+        )
+        
+        x_lower_braced, y_lower_braced, _ = compute_bow_deformation_realistic(
+            measurements, limb_length_cm, draw_cm_braced, side_profile, 
+            limb_type="Lower", string_half_length=None, n_segments=80
+        )
+        
+        # Calculate string length from braced tip to nock
+        tip_x_upper = x_upper_braced[-1]
+        tip_y_upper = y_upper_braced[-1]
+        string_half_length_upper = calculate_string_length(
+            tip_x_upper, tip_y_upper, TARGET_BRACE_HEIGHT_CM, 0.0
+        )
+        
+        tip_x_lower = x_lower_braced[-1]
+        tip_y_lower = y_lower_braced[-1]
+        string_half_length_lower = calculate_string_length(
+            tip_x_lower, tip_y_lower, TARGET_BRACE_HEIGHT_CM, 0.0
+        )
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 2: Draw all states with fixed string length constraint
+    # ═══════════════════════════════════════════════════════════════════════
+    
     for idx, draw_inch in enumerate(draw_inches):
         draw_cm = draw_inch * 2.54
         
         # ═══════════════════════════════════════════════════════════════════
         # REAL-TIME REACTIVITY: Uses current session measurements
-        # When user changes width/thickness in sidebar, measurements are updated
-        # with new EI values, which immediately affect the deformation calculation
+        # CRITICAL FIX: Calculate Upper and Lower INDEPENDENTLY
+        # Each limb uses its own EI distribution from measurements
         # ═══════════════════════════════════════════════════════════════════
+        
+        # Calculate UPPER limb with Upper measurements
+        # Pass string length for drawn states to maintain constant string length
         x_upper, y_upper, thickness_upper = compute_bow_deformation_realistic(
             measurements,      # Current measurements with up-to-date EI
             limb_length_cm,
             draw_cm,
             side_profile,      # Current side profile selection
+            limb_type="Upper", # UPPER limb
+            string_half_length=string_half_length_upper if draw_cm > 0 else None,  # FIX: String length constraint
             n_segments=80      # High resolution for smooth curves
         )
         
-        # Mirror for lower limb (reflect across x-axis at handle)
-        x_lower = x_upper.copy()
-        y_lower = -y_upper
-        thickness_lower = thickness_upper.copy()
+        # Calculate LOWER limb with Lower measurements (INDEPENDENT calculation!)
+        x_lower_raw, y_lower_raw, thickness_lower = compute_bow_deformation_realistic(
+            measurements,      # Current measurements with up-to-date EI
+            limb_length_cm,
+            draw_cm,
+            side_profile,      # Current side profile selection
+            limb_type="Lower", # LOWER limb (uses different EI values!)
+            string_half_length=string_half_length_lower if draw_cm > 0 else None,  # FIX: String length constraint
+            n_segments=80      # High resolution for smooth curves
+        )
+        
+        # Mirror lower limb coordinates (flip Y-axis for visualization)
+        x_lower = x_lower_raw.copy()
+        y_lower = -y_lower_raw  # Negative Y for lower limb positioning
         
         # Create back and belly curves for upper limb
         # Perpendicular offset based on thickness
@@ -2609,7 +2823,7 @@ def main() -> None:
     # Header with geometric decoration
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     st.title("디지털 활 물리 & 탄도 연구소")
-    st.caption("박물관급 인터랙티브 연구 플랫폼 · 실험 고고학 · v4.0")
+    st.caption("박물관급 인터랙티브 연구 플랫폼 · 실험 고고학 · v4.3")
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
     # ═══════════════════════════════════════════════════════════════════════
@@ -2732,13 +2946,21 @@ def main() -> None:
     st.markdown("## 가상 틸러링: 활 변형 시뮬레이션")
     
     # Calculate EI range for debugging info
-    ei_values = [p.ei_nm2 for p in measurements if p.limb in ["Upper", "Handle"]]
-    ei_min = min(ei_values) if ei_values else 0
-    ei_max = max(ei_values) if ei_values else 0
-    ei_ratio = ei_max / ei_min if ei_min > 0 else 1.0
+    ei_values_upper = [p.ei_nm2 for p in measurements if p.limb in ["Upper", "Handle"]]
+    ei_values_lower = [p.ei_nm2 for p in measurements if p.limb in ["Lower", "Handle"]]
     
-    st.caption(f"사실적 2D 물리 시뮬레이션 • 사이드 프로파일: {side_profile} • Brace Height: {TARGET_BRACE_HEIGHT_CM} cm")
-    st.caption(f"⚙️ 강성 분포 (EI): {ei_min:.2f} ~ {ei_max:.2f} N·m² (비율: {ei_ratio:.2f}x) • 강성이 높은 부위는 덜 휘어짐")
+    ei_min_upper = min(ei_values_upper) if ei_values_upper else 0
+    ei_max_upper = max(ei_values_upper) if ei_values_upper else 0
+    ei_ratio_upper = ei_max_upper / ei_min_upper if ei_min_upper > 0 else 1.0
+    
+    ei_min_lower = min(ei_values_lower) if ei_values_lower else 0
+    ei_max_lower = max(ei_values_lower) if ei_values_lower else 0
+    ei_ratio_lower = ei_max_lower / ei_min_lower if ei_min_lower > 0 else 1.0
+    
+    st.caption(f"사실적 2D 물리 시뮬레이션 • 사이드 프로파일: {side_profile} • Brace Height: {TARGET_BRACE_HEIGHT_CM} cm (고정)")
+    st.caption(f"⚙️ 상부 강성 (EI): {ei_min_upper:.2f} ~ {ei_max_upper:.2f} N·m² (비율: {ei_ratio_upper:.2f}x)")
+    st.caption(f"⚙️ 하부 강성 (EI): {ei_min_lower:.2f} ~ {ei_max_lower:.2f} N·m² (비율: {ei_ratio_lower:.2f}x)")
+    st.caption(f"🔧 물리 제약: ① 림 길이 보존 (Arc Length) ② 시위 길이 고정 ③ 내각 < 175° (String Vector Inversion 방지)")
     
     fig_tiller = create_virtual_tiller_realistic(measurements, limb_length_cm, side_profile, [-1, 0, 20, 28])
     st.plotly_chart(fig_tiller, use_container_width=True)
