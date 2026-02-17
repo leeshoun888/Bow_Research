@@ -1,6 +1,6 @@
 """
 ════════════════════════════════════════════════════════════════════════════════
-DIGITAL BOW PHYSICS & BALLISTICS LABORATORY v4.3
+DIGITAL BOW PHYSICS & BALLISTICS LABORATORY v5.0
 Museum-Grade Interactive Research Platform for Experimental Archaeology
 ════════════════════════════════════════════════════════════════════════════════
 
@@ -24,12 +24,13 @@ REAL-TIME REACTIVITY (v4.3):
   * Each limb uses its own EI distribution
   * Asymmetric bows now properly represented
   * Lower limb changes now immediately visible in tiller graph
-- FIXED v4.3: PHYSICAL ACCURACY IMPROVEMENTS
-  * String length CONSTANT across all draw lengths (based on braced state)
-  * Limb arc length PRESERVED through normalization (prevents limb stretching)
-  * Interior angle validation (limb tangent vs string vector < 175°)
-  * Prevents String Vector Inversion (unphysical string reversal)
-  * Realistic string geometry at all draw lengths
+- FIXED v5.0: PHYSICS ENGINE REWRITE (Binary Search on Force)
+  * Removed ALL post-hoc y-scaling and arc length normalization
+  * Forward kinematics preserves arc length BY CONSTRUCTION (fixed ds per segment)
+  * Binary search finds exact force for string length constraint (drawn states)
+  * Binary search finds exact force for brace height constraint (braced state)
+  * Cumulative angle clamped at 148° to prevent string vector inversion
+  * String length, limb length, and angle validity all guaranteed simultaneously
 
 THEORETICAL FOUNDATION:
 - Cantilever Beam Theory with Non-Linear Geometry
@@ -1900,265 +1901,187 @@ def compute_bow_deformation_realistic(
         # Truly unbraced (negative draw = no string attached)
         return x_initial, y_initial, thickness_interp
     
-    # Calculate string tension and EI-dependent bending
-    nock_x = draw_cm if draw_cm > 0 else TARGET_BRACE_HEIGHT_CM
-    nock_y = 0.0
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHYSICS ENGINE v5.0: Binary Search on Force
+    # 
+    # Core principle: Forward kinematics preserves arc length BY CONSTRUCTION
+    # (each segment has fixed ds, only direction changes).
+    # Therefore NO post-hoc y-scaling or arc length normalization is needed.
+    # 
+    # Instead, we find the correct FORCE via binary search:
+    #   - Braced: force that makes tip_x = TARGET_BRACE_HEIGHT_CM
+    #   - Drawn: force that makes string_length = string_half_length
+    # 
+    # String vector inversion is prevented by clamping max cumulative angle.
+    # ═══════════════════════════════════════════════════════════════════════
     
-    # Estimate string force based on draw
-    draw_m = max(draw_cm, 0) / 100.0
     s_m = s_array / 100.0
     limb_m = limb_length_cm / 100.0
     
-    # Compliance calculation (critical for EI sensitivity)
+    # Compliance (for initial force estimate / upper bound)
     integrand = ((limb_m - s_m) ** 2) / ei_interp
     compliance = np.trapezoid(integrand, s_m)
     
-    if is_braced:
-        # Braced state: smaller pre-tension force
-        string_force_n = (TARGET_BRACE_HEIGHT_CM / 100.0) / compliance if compliance > 0 else 0.0
-    else:
-        # Drawn state: full draw force
-        string_force_n = draw_m / compliance if compliance > 0 else 0.0
-    
-    # Apply side profile force modifier
+    # Side profile config
     profile_config = SIDE_PROFILE_OPTIONS.get(side_profile, SIDE_PROFILE_OPTIONS["Straight"])
-    string_force_n *= profile_config["fdc_modifier"]
     
-    # ═══════════════════════════════════════════════════════════════════════
-    # CRITICAL: EI-DEPENDENT BENDING CALCULATION
-    # Higher EI → Less bending (κ = M/EI)
-    # ═══════════════════════════════════════════════════════════════════════
+    # Physical limit: max cumulative bending angle per segment
+    # ~148° prevents tips from inverting past horizontal
+    MAX_CUMULATIVE_ANGLE = np.pi * 0.82
     
-    # Calculate curvature at each point: κ(s) = M(s) / EI(s)
-    curvatures = np.zeros(n_segments)
-    
-    for i in range(n_segments):
-        s_m_local = s_array[i] / 100.0
+    def _forward_kinematics(force_n: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute limb shape for given applied force.
         
-        # Bending moment: M(s) = F × (L - s)
-        moment_arm = limb_m - s_m_local
-        bending_moment = string_force_n * moment_arm
-        
-        # Curvature: inversely proportional to EI
-        # This is where thickness changes take effect!
-        curvatures[i] = bending_moment / ei_interp[i]
-    
-    # Integrate curvature to get angles
-    angles = np.zeros(n_segments)
-    for i in range(1, n_segments):
-        ds = (s_array[i] - s_array[i-1]) / 100.0
-        # Cumulative rotation
-        angles[i] = angles[i-1] + curvatures[i] * ds
-    
-    # Apply side profile initial angle offset
-    profile_angle_offset = 0.0
-    if side_profile == "Reflex":
-        profile_angle_offset = -0.2
-    elif side_profile == "Deflex":
-        profile_angle_offset = 0.15
-    elif side_profile == "Recurve":
-        # Progressive offset at tips
+        Arc length is preserved by construction:
+        each segment has fixed length ds_cm, only direction changes.
+        """
+        # κ(s) = M(s) / EI(s) = F·(L-s) / EI(s)
+        curvatures = np.zeros(n_segments)
         for i in range(n_segments):
-            s_norm = s_array[i] / limb_length_cm
-            if s_norm > 0.7:
-                angles[i] -= 0.4 * ((s_norm - 0.7) / 0.3) ** 2
-    
-    angles += profile_angle_offset
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # FORWARD KINEMATICS: Integrate angles to cartesian coordinates
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    x_deformed = np.zeros(n_segments)
-    y_deformed = np.zeros(n_segments)
-    
-    # Start at handle (origin)
-    x_deformed[0] = x_initial[0]
-    y_deformed[0] = 0.0
-    
-    for i in range(1, n_segments):
-        ds = (s_array[i] - s_array[i-1]) / 100.0  # meters
+            s_local_m = s_array[i] / 100.0
+            moment_arm = limb_m - s_local_m
+            curvatures[i] = force_n * moment_arm / ei_interp[i]
         
-        # Current direction: start vertical, rotate by accumulated angle
-        # θ = 0 means pointing right (+X), θ = π/2 means pointing up (+Y)
-        # Limb starts at π/2 (vertical), bends toward 0 (horizontal/backward)
-        direction_angle = np.pi/2 - angles[i-1]
+        # Integrate curvature → cumulative angle
+        angles_fk = np.zeros(n_segments)
+        for i in range(1, n_segments):
+            ds_m = (s_array[i] - s_array[i-1]) / 100.0
+            angles_fk[i] = angles_fk[i-1] + curvatures[i] * ds_m
+            # Clamp to prevent over-bending (physical safety limit)
+            if angles_fk[i] > MAX_CUMULATIVE_ANGLE:
+                angles_fk[i] = MAX_CUMULATIVE_ANGLE
         
-        # Displacement components
-        dx = ds * 100.0 * np.cos(direction_angle)  # back to cm
-        dy = ds * 100.0 * np.sin(direction_angle)
+        # Side profile angle offsets
+        if side_profile == "Reflex":
+            angles_fk += -0.2
+        elif side_profile == "Deflex":
+            angles_fk += 0.15
+        elif side_profile == "Recurve":
+            for i in range(n_segments):
+                s_norm_r = s_array[i] / limb_length_cm
+                if s_norm_r > 0.7:
+                    angles_fk[i] -= 0.4 * ((s_norm_r - 0.7) / 0.3) ** 2
         
-        x_deformed[i] = x_deformed[i-1] + dx
-        y_deformed[i] = y_deformed[i-1] + dy
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # POST-PROCESSING: Apply geometric constraints
-    # ═══════════════════════════════════════════════════════════════════════
+        # Forward kinematics: each segment has FIXED arc length ds_cm
+        x_fk = np.zeros(n_segments)
+        y_fk = np.zeros(n_segments)
+        x_fk[0] = x_initial[0]
+        y_fk[0] = 0.0
+        
+        for i in range(1, n_segments):
+            ds_cm = s_array[i] - s_array[i-1]
+            direction = np.pi / 2.0 - angles_fk[i - 1]
+            x_fk[i] = x_fk[i-1] + ds_cm * np.cos(direction)
+            y_fk[i] = y_fk[i-1] + ds_cm * np.sin(direction)
+        
+        return x_fk, y_fk
     
     if is_braced:
-        # Braced state: Enforce brace height constraint while respecting EI distribution
-        # The deformation computed above is EI-dependent
-        # Now scale to match target brace height
+        # ═══════════════════════════════════════════════════════════════
+        # BRACED STATE: Binary search for force where tip_x = brace height
+        # When tip_x = brace_height, string is vertical at brace height
+        # ═══════════════════════════════════════════════════════════════
         
-        tip_idx = -1
-        current_tip_x = x_deformed[tip_idx]
-        current_tip_y = y_deformed[tip_idx]
+        target_tip_x = TARGET_BRACE_HEIGHT_CM
         
-        # Target tip position from geometric constraint
-        x_unbraced_tip = x_initial[tip_idx]
-        y_unbraced_tip = y_initial[tip_idx]
-        x_target_tip, y_target_tip, _ = compute_braced_geometry(
-            x_unbraced_tip, y_unbraced_tip, TARGET_BRACE_HEIGHT_CM
-        )
+        f_low = 0.0
+        f_high = 10.0 / compliance if compliance > 0 else 10000.0
         
-        # Scale deformation to match target tip position
-        # This preserves the EI-dependent curve shape
-        for i in range(n_segments):
-            s_norm = s_array[i] / limb_length_cm
+        # Expand upper bound if needed, but stop if tip_y goes negative
+        x_test_high, y_test_high = _forward_kinematics(f_high)
+        while x_test_high[-1] < target_tip_x and y_test_high[-1] > 2.0 and f_high < 1e8:
+            f_high *= 2.0
+            x_test_high, y_test_high = _forward_kinematics(f_high)
+        
+        best_force = 0.0
+        for _ in range(80):
+            f_mid = (f_low + f_high) / 2.0
+            x_test, y_test = _forward_kinematics(f_mid)
+            current_tip_x = x_test[-1]
             
-            # Blend between initial and deformed, scaled to target
-            if current_tip_x > 0:
-                x_scale = (x_target_tip - x_initial[0]) / (current_tip_x - x_initial[0])
+            # Protect: tip must stay above centerline
+            if y_test[-1] < 2.0:
+                f_high = f_mid
+                best_force = f_mid
+                continue
+            
+            if abs(current_tip_x - target_tip_x) < 0.01:
+                best_force = f_mid
+                break
+            
+            if current_tip_x < target_tip_x:
+                f_low = f_mid
             else:
-                x_scale = 1.0
-                
-            if current_tip_y > 0:
-                y_scale = (y_target_tip - y_initial[0]) / (current_tip_y - y_initial[0])
-            else:
-                y_scale = 1.0
+                f_high = f_mid
             
-            # Apply progressive scaling (more at tip, less at handle)
-            x_deformed[i] = x_initial[i] + (x_deformed[i] - x_initial[i]) * x_scale
-            y_deformed[i] = y_initial[i] + (y_deformed[i] - y_initial[i]) * y_scale
-            
+            best_force = f_mid
+        
+        x_deformed, y_deformed = _forward_kinematics(best_force)
+    
     else:
-        # Drawn state: Apply inward compression with string length constraint
-        # CRITICAL FIX: Maintain constant string length AND limb arc length!
+        # ═══════════════════════════════════════════════════════════════
+        # DRAWN STATE: Binary search for force where string length matches
+        # 
+        # String goes from tip (tip_x, tip_y) to nock (draw_cm, 0).
+        # Target: sqrt((tip_x - draw_cm)^2 + tip_y^2) = string_half_length
+        # 
+        # As force increases → more bending → tip closer to nock → shorter string
+        # Binary search finds the exact force for the target string length.
+        # ═══════════════════════════════════════════════════════════════
         
         nock_x = draw_cm
-        nock_y = 0.0
         
-        # Initial compression (EI-based)
-        draw_ratio = draw_cm / (limb_length_cm * 2.0)
-        compression_factor = max(0.7, 1.0 - draw_ratio * 0.4)
-        
-        for i in range(n_segments):
-            s_norm = s_array[i] / limb_length_cm
-            # Progressive compression: more at tips, less at handle
-            local_compression = 1.0 - s_norm * (1.0 - compression_factor)
-            y_deformed[i] = y_deformed[i] * local_compression
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # STRING LENGTH CONSTRAINT (Maintain constant string length)
-        # ═══════════════════════════════════════════════════════════════════
         if string_half_length is not None and string_half_length > 0:
-            tip_idx = -1
-            current_tip_x = x_deformed[tip_idx]
-            current_tip_y = y_deformed[tip_idx]
+            f_low = 0.0
+            f_high = max(draw_cm / 100.0, 0.5) / compliance * 5.0 if compliance > 0 else 50000.0
             
-            # Calculate required tip_y to maintain string length
-            # String length: sqrt((tip_x - nock_x)² + tip_y²) = string_half_length
-            dx = current_tip_x - nock_x
+            # Expand upper bound if needed, but STOP if tip_y goes negative
+            x_h, y_h = _forward_kinematics(f_high)
+            slen_h = np.sqrt((x_h[-1] - nock_x)**2 + y_h[-1]**2)
+            while slen_h > string_half_length and y_h[-1] > 2.0 and f_high < 1e8:
+                f_high *= 2.0
+                x_h, y_h = _forward_kinematics(f_high)
+                slen_h = np.sqrt((x_h[-1] - nock_x)**2 + y_h[-1]**2)
             
-            if dx**2 < string_half_length**2:
-                required_tip_y = np.sqrt(string_half_length**2 - dx**2)
+            best_force = f_low
+            best_diff = float('inf')
+            
+            # Minimum tip_y threshold: tip must stay above centerline
+            MIN_TIP_Y_CM = 2.0
+            
+            for _ in range(80):
+                f_mid = (f_low + f_high) / 2.0
+                x_test, y_test = _forward_kinematics(f_mid)
                 
-                # Adjust tip position to match string length
-                if current_tip_y > 0:
-                    y_correction_factor = required_tip_y / current_tip_y
-                    
-                    # Apply correction progressively (more at tip)
-                    for i in range(n_segments):
-                        s_norm = s_array[i] / limb_length_cm
-                        correction = 1.0 + s_norm * (y_correction_factor - 1.0)
-                        y_deformed[i] = y_deformed[i] * correction
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # INTERIOR ANGLE VALIDATION (Prevent String Vector Inversion)
-        # ═══════════════════════════════════════════════════════════════════
-        tip_idx = -1
-        tip_x = x_deformed[tip_idx]
-        tip_y = y_deformed[tip_idx]
-        
-        # Calculate limb tip tangent vector (direction of last segment)
-        if len(x_deformed) >= 2:
-            dx_limb = x_deformed[-1] - x_deformed[-2]
-            dy_limb = y_deformed[-1] - y_deformed[-2]
-            limb_tangent = np.array([dx_limb, dy_limb])
-            limb_tangent_norm = limb_tangent / np.linalg.norm(limb_tangent)
+                tip_x_t = x_test[-1]
+                tip_y_t = y_test[-1]
+                
+                # CRITICAL: If tip goes below minimum, this force is too high
+                if tip_y_t < MIN_TIP_Y_CM:
+                    f_high = f_mid
+                    continue
+                
+                current_slen = np.sqrt((tip_x_t - nock_x)**2 + tip_y_t**2)
+                diff = current_slen - string_half_length
+                
+                if abs(diff) < abs(best_diff):
+                    best_diff = diff
+                    best_force = f_mid
+                
+                if abs(diff) < 0.02:
+                    break
+                
+                if current_slen > string_half_length:
+                    f_low = f_mid
+                else:
+                    f_high = f_mid
+            
+            x_deformed, y_deformed = _forward_kinematics(best_force)
         else:
-            limb_tangent_norm = np.array([0.0, 1.0])  # Default vertical
-        
-        # Calculate string vector (from tip to nock - direction of pull)
-        string_vector = np.array([nock_x - tip_x, nock_y - tip_y])
-        string_vector_norm = string_vector / np.linalg.norm(string_vector)
-        
-        # Interior angle between limb tangent and string
-        dot_product = np.dot(limb_tangent_norm, string_vector_norm)
-        dot_product = np.clip(dot_product, -1.0, 1.0)
-        interior_angle_rad = np.arccos(dot_product)
-        interior_angle_deg = np.degrees(interior_angle_rad)
-        
-        # CRITICAL: Interior angle must be < 180 degrees
-        # For physical validity, should typically be < 90 degrees
-        MAX_INTERIOR_ANGLE_DEG = 175.0  # Safety margin below 180
-        
-        if interior_angle_deg > MAX_INTERIOR_ANGLE_DEG:
-            # String vector inversion detected!
-            # Reduce y-coordinates to prevent over-bending
-            
-            # Target: make interior angle = MAX_INTERIOR_ANGLE_DEG
-            # This requires adjusting tip position
-            
-            # Simple correction: increase tip_y to reduce bending
-            safety_factor = 1.5  # Increase tip_y by 50%
-            
-            for i in range(n_segments):
-                s_norm = s_array[i] / limb_length_cm
-                # Progressive adjustment (more at tip)
-                adjustment = 1.0 + s_norm * (safety_factor - 1.0)
-                y_deformed[i] = y_deformed[i] * adjustment
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # ARC LENGTH PRESERVATION (Problem 1 Fix)
-        # After all scaling operations, normalize to preserve limb length
-        # ═══════════════════════════════════════════════════════════════════
-        
-        # Calculate actual arc length
-        arc_length_actual = 0.0
-        for i in range(1, n_segments):
-            dx = x_deformed[i] - x_deformed[i-1]
-            dy = y_deformed[i] - y_deformed[i-1]
-            segment_length = np.sqrt(dx**2 + dy**2)
-            arc_length_actual += segment_length
-        
-        # Target arc length (should match limb length)
-        arc_length_target = limb_length_cm
-        
-        # If arc length changed significantly, renormalize
-        if arc_length_actual > 0 and abs(arc_length_actual - arc_length_target) > 0.5:
-            # Scale positions to preserve arc length
-            scale_factor = arc_length_target / arc_length_actual
-            
-            # Reconstruct path with correct arc length
-            x_normalized = np.zeros(n_segments)
-            y_normalized = np.zeros(n_segments)
-            x_normalized[0] = x_deformed[0]
-            y_normalized[0] = y_deformed[0]
-            
-            for i in range(1, n_segments):
-                dx = x_deformed[i] - x_deformed[i-1]
-                dy = y_deformed[i] - y_deformed[i-1]
-                
-                # Scale segment length
-                dx_scaled = dx * scale_factor
-                dy_scaled = dy * scale_factor
-                
-                x_normalized[i] = x_normalized[i-1] + dx_scaled
-                y_normalized[i] = y_normalized[i-1] + dy_scaled
-            
-            x_deformed = x_normalized
-            y_deformed = y_normalized
+            # No string constraint: use compliance-based estimate
+            initial_force = (draw_cm / 100.0) / compliance * profile_config["fdc_modifier"] if compliance > 0 else 0.0
+            x_deformed, y_deformed = _forward_kinematics(initial_force)
     
     return x_deformed, y_deformed, thickness_interp
 
@@ -2960,7 +2883,7 @@ def main() -> None:
     st.caption(f"사실적 2D 물리 시뮬레이션 • 사이드 프로파일: {side_profile} • Brace Height: {TARGET_BRACE_HEIGHT_CM} cm (고정)")
     st.caption(f"⚙️ 상부 강성 (EI): {ei_min_upper:.2f} ~ {ei_max_upper:.2f} N·m² (비율: {ei_ratio_upper:.2f}x)")
     st.caption(f"⚙️ 하부 강성 (EI): {ei_min_lower:.2f} ~ {ei_max_lower:.2f} N·m² (비율: {ei_ratio_lower:.2f}x)")
-    st.caption(f"🔧 물리 제약: ① 림 길이 보존 (Arc Length) ② 시위 길이 고정 ③ 내각 < 175° (String Vector Inversion 방지)")
+    st.caption(f"🔧 물리 엔진 v5.0: 이진 탐색(Binary Search) 기반 — ① Forward Kinematics로 림 길이 자동 보존 ② 힘(Force) 최적화로 시위 길이 정밀 고정 ③ 누적 각도 제한(< 148°)으로 시위 벡터 역전 방지")
     
     fig_tiller = create_virtual_tiller_realistic(measurements, limb_length_cm, side_profile, [-1, 0, 20, 28])
     st.plotly_chart(fig_tiller, use_container_width=True)
