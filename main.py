@@ -231,6 +231,8 @@ class ForceCurvePoint:
     force_lbs: float
     string_angle_deg: float
     tip_deflection_cm: float
+    stored_energy_j: float = 0.0
+    tip_bow_angle_deg: float = 0.0
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -579,13 +581,14 @@ def compute_geometric_fdc(
     n_steps: int = FDC_DRAW_STEPS
 ) -> List[ForceCurvePoint]:
     """
-    Compute Force-Draw Curve with geometric string angle effects
+    Compute force-draw curve from limb deformation energy states.
     
-    STACKING PHENOMENON:
-    - As draw increases, tip bends more → string angle increases
-    - Higher angle → more force required for same additional draw
-    - Taper (thin tips) → early stacking
-    - Parallel (thick tips) → delayed stacking
+    Method:
+    - Solve upper/lower limb shapes independently at each draw step.
+    - Enforce fixed string length determined from braced state.
+    - Include side profile geometry + 7-point EI/side-angle distribution.
+    - Compute stored energy U(draw) from strain energy.
+    - Convert to draw force via F(draw) = dU/dx.
     
     Parameters:
     -----------
@@ -599,96 +602,97 @@ def compute_geometric_fdc(
     List[ForceCurvePoint] : Force-draw curve data
     """
     draw_inches = np.linspace(0, max_draw_inch, n_steps)
-    fdc_points = []
+    draw_cm_values = draw_inches * INCH_TO_CM
+    draw_m_values = draw_inches * INCH_TO_M
     
-    # Get side profile modifiers
-    profile_config = SIDE_PROFILE_OPTIONS.get(side_profile, SIDE_PROFILE_OPTIONS["Straight"])
-    fdc_modifier = profile_config["fdc_modifier"]
-    stacking_modifier = profile_config["stacking_modifier"]
+    # Braced state defines fixed string half-length for subsequent draw states.
+    upper_braced = _solve_limb_deformation_state(
+        measurements=measurements,
+        limb_length_cm=limb_length_cm,
+        draw_cm=0.0,
+        side_profile=side_profile,
+        limb_type="Upper",
+        string_half_length=None,
+        n_segments=100,
+        draw_from_brace=True,
+    )
+    lower_braced = _solve_limb_deformation_state(
+        measurements=measurements,
+        limb_length_cm=limb_length_cm,
+        draw_cm=0.0,
+        side_profile=side_profile,
+        limb_type="Lower",
+        string_half_length=None,
+        n_segments=100,
+        draw_from_brace=True,
+    )
     
-    for draw_inch in draw_inches:
-        draw_m = draw_inch * INCH_TO_M
-        
-        # Initial force estimate (linear approximation)
-        # Refine iteratively considering string angle
-        
-        # Extract EI profile
-        positions = [p.position_cm for p in measurements]
-        ei_values = [max(p.ei_nm2, 1e-10) for p in measurements]
-        
-        s_cm = np.array(positions, dtype=float)
-        ei = np.array(ei_values, dtype=float)
-        
-        sort_idx = np.argsort(s_cm)
-        s_sorted = s_cm[sort_idx]
-        ei_sorted = ei[sort_idx]
-        
-        s_unique = np.unique(s_sorted)
-        ei_unique = np.array([ei_sorted[s_sorted == s].mean() for s in s_unique])
-        
-        if len(s_unique) < 2:
-            s_unique = np.array([0.0, limb_length_cm])
-            ei_unique = np.array([ei_unique[0], ei_unique[0]])
-        
-        # Interpolate and integrate compliance
-        s_samples_cm = np.linspace(0, limb_length_cm, INTEGRATION_STEPS)
-        ei_samples = np.maximum(np.interp(s_samples_cm, s_unique, ei_unique), 1e-10)
-        
-        s_m = s_samples_cm * CM_TO_M
-        L_m = limb_length_cm * CM_TO_M
-        
-        # Compliance integral: C = ∫ (L-s)²/EI ds
-        integrand = ((L_m - s_m) ** 2) / ei_samples
-        compliance = np.trapezoid(integrand, s_m)
-        
-        if compliance <= 0:
-            force_n = 0.0
-        else:
-            force_n = draw_m / compliance
-        
-        # String angle effect (stacking multiplier)
-        # Compute tip deflection
-        tip_deflection_cm = draw_inch * INCH_TO_CM
-        string_angle_deg = compute_string_angle(tip_deflection_cm, limb_length_cm)
-        
-        # Stacking factor: increases exponentially with angle
-        # Physical basis: F_effective = F_linear / cos(θ)
-        # Additional taper effect: thinner tips stack earlier
-        
-        # Taper ratio: tip EI / handle EI
-        handle_ei = measurements[0].ei_nm2
-        tip_ei = measurements[-1].ei_nm2
-        taper_ratio = tip_ei / max(handle_ei, 1e-10)
-        
-        # Stacking multiplier
-        angle_rad = math.radians(string_angle_deg)
-        cos_angle = math.cos(angle_rad)
-        
-        if cos_angle < 0.1:
-            cos_angle = 0.1  # Prevent singularity
-        
-        stacking_factor = 1.0 / cos_angle
-        
-        # Taper penalty: thin tips stack earlier
-        taper_penalty = 1.0 + (1.0 - taper_ratio) * (angle_rad ** 2)
-        
-        # Apply side profile modifiers
-        force_n_effective = force_n * stacking_factor * taper_penalty * fdc_modifier
-        
-        # Stacking modifier affects how early stacking occurs
-        stacking_factor_adjusted = stacking_factor ** stacking_modifier
-        force_n_effective = force_n * stacking_factor_adjusted * taper_penalty * fdc_modifier
-        
-        force_lbs = force_n_effective * N_TO_LBS
-        
-        fdc_point = ForceCurvePoint(
-            draw_inch=draw_inch,
-            force_lbs=force_lbs,
-            string_angle_deg=string_angle_deg,
-            tip_deflection_cm=tip_deflection_cm
+    string_half_upper = calculate_string_length(
+        upper_braced["tip_x_cm"], upper_braced["tip_y_cm"], TARGET_BRACE_HEIGHT_CM, 0.0
+    )
+    string_half_lower = calculate_string_length(
+        lower_braced["tip_x_cm"], lower_braced["tip_y_cm"], TARGET_BRACE_HEIGHT_CM, 0.0
+    )
+    
+    total_energy_j: List[float] = []
+    mean_string_angle_deg: List[float] = []
+    mean_tip_bow_angle_deg: List[float] = []
+    
+    for draw_cm in draw_cm_values:
+        upper_state = _solve_limb_deformation_state(
+            measurements=measurements,
+            limb_length_cm=limb_length_cm,
+            draw_cm=float(draw_cm),
+            side_profile=side_profile,
+            limb_type="Upper",
+            string_half_length=string_half_upper,
+            n_segments=100,
+            draw_from_brace=True,
+        )
+        lower_state = _solve_limb_deformation_state(
+            measurements=measurements,
+            limb_length_cm=limb_length_cm,
+            draw_cm=float(draw_cm),
+            side_profile=side_profile,
+            limb_type="Lower",
+            string_half_length=string_half_lower,
+            n_segments=100,
+            draw_from_brace=True,
         )
         
-        fdc_points.append(fdc_point)
+        total_energy_j.append(
+            float(upper_state["strain_energy_j"] + lower_state["strain_energy_j"])
+        )
+        mean_string_angle_deg.append(
+            0.5 * (upper_state["tip_string_angle_deg"] + lower_state["tip_string_angle_deg"])
+        )
+        mean_tip_bow_angle_deg.append(
+            0.5 * (upper_state["tip_bow_angle_deg"] + lower_state["tip_bow_angle_deg"])
+        )
+    
+    # Stored energy baseline is the braced state (draw = 0).
+    energy_array = np.array(total_energy_j, dtype=float)
+    stored_energy = np.maximum(energy_array - energy_array[0], 0.0)
+    # Numerical safety: enforce non-decreasing stored energy with draw.
+    stored_energy = np.maximum.accumulate(stored_energy)
+    
+    # Draw force from energy gradient.
+    if len(draw_m_values) >= 3:
+        force_n = np.gradient(stored_energy, draw_m_values, edge_order=2)
+    else:
+        force_n = np.gradient(stored_energy, draw_m_values)
+    force_n = np.maximum(force_n, 0.0)
+    
+    fdc_points: List[ForceCurvePoint] = []
+    for i, draw_inch in enumerate(draw_inches):
+        fdc_points.append(ForceCurvePoint(
+            draw_inch=float(draw_inch),
+            force_lbs=float(force_n[i] * N_TO_LBS),
+            string_angle_deg=float(mean_string_angle_deg[i]),
+            tip_deflection_cm=float(draw_cm_values[i]),
+            stored_energy_j=float(stored_energy[i]),
+            tip_bow_angle_deg=float(mean_tip_bow_angle_deg[i]),
+        ))
     
     return fdc_points
 
@@ -751,13 +755,18 @@ def calculate_stored_energy(fdc: List[ForceCurvePoint]) -> float:
     --------
     float : Stored energy [Joules]
     """
+    if not fdc:
+        return 0.0
+    
+    solved_energy = max((p.stored_energy_j for p in fdc), default=0.0)
+    if solved_energy > 0:
+        return float(solved_energy)
+    
     draws_m = np.array([p.draw_inch * INCH_TO_M for p in fdc])
     forces_n = np.array([p.force_lbs * LBS_TO_N for p in fdc])
     
-    # Integrate using Simpson's rule
-    energy_j = simpson(forces_n, x=draws_m)
-    
-    return energy_j
+    # Fallback integration for legacy curves without per-point energy.
+    return float(simpson(forces_n, x=draws_m))
 
 
 def calculate_shooting_efficiency(
@@ -1564,6 +1573,7 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
     
     draws = [p.draw_inch for p in fdc]
     forces = [p.force_lbs for p in fdc]
+    energies = [p.stored_energy_j for p in fdc]
     
     fig = go.Figure()
     
@@ -1576,6 +1586,16 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         line=dict(color='#00d4ff', width=3),
         fill='tozeroy',
         fillcolor='rgba(0, 212, 255, 0.15)',
+    ))
+    
+    # Stored energy curve (secondary axis) to keep FDC and energy consistent visually.
+    fig.add_trace(go.Scatter(
+        x=draws,
+        y=energies,
+        mode='lines',
+        name='저장 에너지',
+        line=dict(color='#ffd700', width=2, dash='dot'),
+        yaxis='y2',
     ))
     
     # Highlight 28" point
@@ -1612,6 +1632,13 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
             bordercolor='#2a3f5f',
             borderwidth=1
         ),
+        yaxis2=dict(
+            title="저장 에너지 (J)",
+            overlaying='y',
+            side='right',
+            showgrid=False,
+            color='#ffd700',
+        ),
         height=500,
     )
     
@@ -1630,10 +1657,11 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
 
 
 def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
-    """Visualize string angle progression (stacking indicator) - Museum Dark Mode"""
+    """Visualize string angle and tip-bow angle progression."""
     
     draws = [p.draw_inch for p in fdc]
     angles = [p.string_angle_deg for p in fdc]
+    tip_bow_angles = [p.tip_bow_angle_deg for p in fdc]
     
     fig = go.Figure()
     
@@ -1645,6 +1673,14 @@ def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         line=dict(color='#ff6b6b', width=3),
         fill='tozeroy',
         fillcolor='rgba(255, 107, 107, 0.15)',
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=draws,
+        y=tip_bow_angles,
+        mode='lines',
+        name='Tip-Bow 각도',
+        line=dict(color='#00d4ff', width=2, dash='dot'),
     ))
     
     # Critical angle indicator (around 45 degrees - high stacking)
@@ -1666,15 +1702,15 @@ def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
     )
     
     fig.update_layout(
-        title="시위 각도 변화 (스택킹 지표)",
+        title="각도 변화 (시위각 / Tip-Bow)",
         xaxis_title="드로우 길이 (인치)",
-        yaxis_title="시위 각도 (도)",
+        yaxis_title="각도 (도)",
         template="plotly_dark",
         paper_bgcolor='#0d111f',
         plot_bgcolor='#1a1f3a',
         font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
         height=400,
-        showlegend=False,
+        showlegend=True,
     )
     
     fig.update_xaxes(
@@ -1722,34 +1758,35 @@ def compute_initial_side_profile(
     x_initial = np.zeros_like(s_positions)
     y_initial = s_positions.copy()
     
+    # Scale curvature amplitude by limb size so side-profile effects
+    # remain physically meaningful across bow lengths.
+    base_amp = 0.08 * limb_length_cm
+    
     if profile_type == "Straight":
         # No curvature
         pass
     
     elif profile_type == "Reflex":
-        # Tips curve away from archer (negative X direction initially)
-        # Parabolic curve: x = -k * s²
-        x_initial = -reflex_factor * 2.0 * (s_norm ** 2)
+        # Whole limb curves away from archer (preload).
+        x_initial = -reflex_factor * base_amp * (s_norm ** 1.8)
     
     elif profile_type == "Deflex":
-        # Tips curve toward archer (positive X direction initially)
-        x_initial = -reflex_factor * 2.0 * (s_norm ** 2)  # reflex_factor is negative
+        # Whole limb curves toward archer (smooth draw).
+        x_initial = -reflex_factor * 0.85 * base_amp * (s_norm ** 1.7)
     
     elif profile_type == "Recurve":
-        # Working limb straight, tips recurve strongly
-        # Only last 30% curves
+        # Working limb mostly straight, last 30% recurved strongly.
         recurve_start = 0.7
         for i, s in enumerate(s_norm):
             if s < recurve_start:
                 x_initial[i] = 0.0
             else:
-                # Strong curve at tips
                 local_norm = (s - recurve_start) / (1.0 - recurve_start)
-                x_initial[i] = -reflex_factor * 3.0 * (local_norm ** 2)
+                x_initial[i] = -reflex_factor * 1.25 * base_amp * (local_norm ** 1.8)
     
     elif profile_type == "Decurve":
-        # Smooth deflex throughout
-        x_initial = -reflex_factor * 1.5 * (s_norm ** 1.5)
+        # Deflexed working limb with stronger near-tip forward set.
+        x_initial = -reflex_factor * 0.95 * base_amp * (s_norm ** 1.5)
     
     return x_initial, y_initial
 
@@ -1835,6 +1872,217 @@ def compute_braced_geometry(
     return x_braced_tip, y_braced_tip, string_half_length
 
 
+def _solve_limb_deformation_state(
+    measurements: List[MeasurementPoint],
+    limb_length_cm: float,
+    draw_cm: float,
+    side_profile: str,
+    limb_type: str = "Upper",
+    string_half_length: Optional[float] = None,
+    n_segments: int = 100,
+    draw_from_brace: bool = True,
+) -> Dict[str, object]:
+    """
+    Solve one limb deformation state and return geometry + physics diagnostics.
+    
+    Includes:
+    - EI-distributed bending response
+    - side profile baseline geometry
+    - 7-point side-angle interpolation
+    - tip/string/bow angle diagnostics
+    - local bending at measurement points
+    """
+    target_limb = [p for p in measurements if p.limb in ["Handle", limb_type]]
+    target_limb.sort(key=lambda p: p.position_cm)
+    
+    s_array = np.linspace(0, limb_length_cm, n_segments)
+    if len(target_limb) < 2:
+        zeros = np.zeros_like(s_array)
+        return {
+            "x_coords": zeros,
+            "y_coords": s_array.copy(),
+            "thickness_profile": np.ones_like(s_array),
+            "applied_force_n": 0.0,
+            "strain_energy_j": 0.0,
+            "tip_x_cm": 0.0,
+            "tip_y_cm": float(limb_length_cm),
+            "tip_bow_angle_deg": 0.0,
+            "tip_string_angle_deg": 0.0,
+            "point_bending_deg": {},
+            "mean_abs_bending_deg": 0.0,
+        }
+    
+    positions = np.array([p.position_cm for p in target_limb], dtype=float)
+    ei_values = np.array([max(p.ei_nm2, 1e-10) for p in target_limb], dtype=float)
+    thickness_values = np.array([p.thickness_mm / 10.0 for p in target_limb], dtype=float)
+    side_angle_deg_values = np.array([p.side_angle_deg for p in target_limb], dtype=float)
+    
+    unique_pos = np.unique(positions)
+    unique_ei = np.array([ei_values[positions == pos].mean() for pos in unique_pos], dtype=float)
+    unique_thickness = np.array([thickness_values[positions == pos].mean() for pos in unique_pos], dtype=float)
+    unique_side_angle_deg = np.array(
+        [side_angle_deg_values[positions == pos].mean() for pos in unique_pos], dtype=float
+    )
+    
+    if len(unique_pos) < 2:
+        unique_pos = np.array([0.0, limb_length_cm], dtype=float)
+        unique_ei = np.array([unique_ei[0], unique_ei[0]], dtype=float)
+        unique_thickness = np.array([unique_thickness[0], unique_thickness[0]], dtype=float)
+        unique_side_angle_deg = np.array([unique_side_angle_deg[0], unique_side_angle_deg[0]], dtype=float)
+    
+    ei_interp = np.maximum(np.interp(s_array, unique_pos, unique_ei), 1e-10)
+    thickness_interp = np.interp(s_array, unique_pos, unique_thickness)
+    side_angle_interp_rad = np.radians(np.interp(s_array, unique_pos, unique_side_angle_deg))
+    
+    x_initial, y_initial = compute_initial_side_profile(s_array, limb_length_cm, side_profile)
+    
+    # Baseline tangent from side profile + user side-angle input.
+    dx0 = np.gradient(x_initial, s_array)
+    dy0 = np.gradient(y_initial, s_array)
+    theta_initial = np.arctan2(dy0, dx0)
+    theta_rest = theta_initial + side_angle_interp_rad
+    
+    s_m = s_array * CM_TO_M
+    limb_m = limb_length_cm * CM_TO_M
+    
+    compliance_integrand = ((limb_m - s_m) ** 2) / ei_interp
+    compliance = float(np.trapezoid(compliance_integrand, s_m))
+    compliance = max(compliance, 1e-12)
+    
+    max_delta_angle_rad = np.pi * 0.82
+    
+    def _forward_from_force(force_n: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        moments = force_n * (limb_m - s_m)
+        curvatures = moments / ei_interp
+        
+        delta_theta = np.zeros(n_segments)
+        for i in range(1, n_segments):
+            delta_theta[i] = delta_theta[i - 1] + curvatures[i] * (s_m[i] - s_m[i - 1])
+            if delta_theta[i] > max_delta_angle_rad:
+                delta_theta[i] = max_delta_angle_rad
+        
+        # Draw force bends limb toward +X direction.
+        theta_total = theta_rest - delta_theta
+        
+        x_coords = np.zeros(n_segments)
+        y_coords = np.zeros(n_segments)
+        x_coords[0] = x_initial[0]
+        y_coords[0] = 0.0
+        for i in range(1, n_segments):
+            ds_cm = s_array[i] - s_array[i - 1]
+            x_coords[i] = x_coords[i - 1] + ds_cm * np.cos(theta_total[i - 1])
+            y_coords[i] = y_coords[i - 1] + ds_cm * np.sin(theta_total[i - 1])
+        
+        return x_coords, y_coords, theta_total, delta_theta, moments
+    
+    force_n = 0.0
+    x_state, y_state, theta_state, delta_state, moments_state = _forward_from_force(0.0)
+    
+    if draw_cm >= 0:
+        is_braced = draw_cm == 0
+        
+        def _error_for_force(test_force: float) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            x_t, y_t, theta_t, delta_t, moments_t = _forward_from_force(test_force)
+            if is_braced:
+                err = x_t[-1] - TARGET_BRACE_HEIGHT_CM
+            else:
+                nock_x = TARGET_BRACE_HEIGHT_CM + draw_cm if draw_from_brace else draw_cm
+                target_len = string_half_length if (string_half_length is not None and string_half_length > 0) else None
+                if target_len is None:
+                    # fallback when no string constraint
+                    err = x_t[-1] - (TARGET_BRACE_HEIGHT_CM + draw_cm)
+                else:
+                    err = calculate_string_length(x_t[-1], y_t[-1], nock_x, 0.0) - target_len
+            return err, x_t, y_t, theta_t, delta_t, moments_t
+        
+        f_low = 0.0
+        f_guess = (max(draw_cm, TARGET_BRACE_HEIGHT_CM) * CM_TO_M) / compliance
+        f_high = max(10.0, f_guess * 8.0)
+        
+        err_low, x_l, y_l, theta_l, delta_l, moments_l = _error_for_force(f_low)
+        err_high, x_h, y_h, theta_h, delta_h, moments_h = _error_for_force(f_high)
+        
+        # Expand upper bound until sign change or safety limit.
+        tries = 0
+        while err_low * err_high > 0 and tries < 24 and f_high < 1e8:
+            f_high *= 2.0
+            err_high, x_h, y_h, theta_h, delta_h, moments_h = _error_for_force(f_high)
+            tries += 1
+        
+        best_abs_err = float("inf")
+        if err_low * err_high <= 0:
+            for _ in range(90):
+                f_mid = 0.5 * (f_low + f_high)
+                err_mid, x_m, y_m, theta_m, delta_m, moments_m = _error_for_force(f_mid)
+                
+                if y_m[-1] < 1.5:
+                    f_high = f_mid
+                    continue
+                
+                if abs(err_mid) < best_abs_err:
+                    best_abs_err = abs(err_mid)
+                    force_n = f_mid
+                    x_state, y_state = x_m, y_m
+                    theta_state, delta_state, moments_state = theta_m, delta_m, moments_m
+                
+                if abs(err_mid) < 0.01:
+                    break
+                
+                if err_low * err_mid <= 0:
+                    f_high = f_mid
+                    err_high = err_mid
+                else:
+                    f_low = f_mid
+                    err_low = err_mid
+        else:
+            # No clear bracket: choose better endpoint.
+            candidates = [
+                (abs(err_low), f_low, x_l, y_l, theta_l, delta_l, moments_l),
+                (abs(err_high), f_high, x_h, y_h, theta_h, delta_h, moments_h),
+            ]
+            best = min(candidates, key=lambda t: t[0])
+            force_n = best[1]
+            x_state, y_state, theta_state, delta_state, moments_state = best[2], best[3], best[4], best[5], best[6]
+    
+    tip_x = float(x_state[-1])
+    tip_y = float(y_state[-1])
+    
+    # U = ∫ M^2 / (2EI) ds
+    strain_energy = float(np.trapezoid((moments_state ** 2) / (2.0 * ei_interp), s_m))
+    
+    tip_tangent_rad = float(theta_state[-1])
+    tip_tangent_deg = math.degrees(tip_tangent_rad)
+    # Deviation from local vertical bow axis.
+    tip_bow_angle_deg = abs(((tip_tangent_deg - 90.0 + 180.0) % 360.0) - 180.0)
+    
+    nock_x_eval = TARGET_BRACE_HEIGHT_CM + max(draw_cm, 0.0) if draw_from_brace else max(draw_cm, 0.0)
+    string_dir_rad = math.atan2(-tip_y, nock_x_eval - tip_x)
+    angle_diff_deg = abs(math.degrees(string_dir_rad - tip_tangent_rad))
+    angle_diff_deg = abs(((angle_diff_deg + 180.0) % 360.0) - 180.0)
+    tip_string_angle_deg = min(angle_diff_deg, 180.0 - angle_diff_deg)
+    
+    point_bending_deg: Dict[int, float] = {}
+    for p in target_limb:
+        point_bending_deg[p.point_id] = math.degrees(float(np.interp(p.position_cm, s_array, delta_state)))
+    
+    bending_vals = [abs(v) for pid, v in point_bending_deg.items() if pid != 0]
+    mean_abs_bending_deg = float(np.mean(bending_vals)) if bending_vals else 0.0
+    
+    return {
+        "x_coords": x_state,
+        "y_coords": y_state,
+        "thickness_profile": thickness_interp,
+        "applied_force_n": float(force_n),
+        "strain_energy_j": strain_energy,
+        "tip_x_cm": tip_x,
+        "tip_y_cm": tip_y,
+        "tip_bow_angle_deg": float(tip_bow_angle_deg),
+        "tip_string_angle_deg": float(tip_string_angle_deg),
+        "point_bending_deg": point_bending_deg,
+        "mean_abs_bending_deg": mean_abs_bending_deg,
+    }
+
+
 def compute_bow_deformation_realistic(
     measurements: List[MeasurementPoint],
     limb_length_cm: float,
@@ -1844,246 +2092,22 @@ def compute_bow_deformation_realistic(
     string_half_length: Optional[float] = None,
     n_segments: int = 80
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute PHYSICALLY CORRECT bow deformation under draw with EI-dependent bending
-    
-    Key physics:
-    - Bow stands vertically along Y-axis
-    - String pulls tips inward (toward Y=0) and backward (toward +X)
-    - Draw force creates bending moment that curves limbs
-    - CRITICAL: Bending inversely proportional to EI (stiffer sections bend less)
-    
-    Real-time reactivity:
-    - Uses current measurements EI values directly
-    - Thickness changes immediately affect local stiffness
-    - Side profile provides initial geometry
-    - FIXED: Now calculates Upper and Lower limbs INDEPENDENTLY
-    
-    Parameters:
-    -----------
-    measurements : List[MeasurementPoint]
-        Current measurement data with up-to-date EI values
-    limb_length_cm : float
-    draw_cm : float
-    side_profile : str
-    limb_type : str
-        "Upper" or "Lower" - selects which limb to calculate
-    string_half_length : Optional[float]
-        Fixed string length [cm] - if provided, enforces constant string length
-    n_segments : int
-    
-    Returns:
-    --------
-    Tuple[np.ndarray, np.ndarray, np.ndarray]
-        (x_coords, y_coords, thickness_profile)
-    """
-    # Extract limb data based on limb_type - CRITICAL FIX!
-    # Upper and Lower are now calculated INDEPENDENTLY with their own EI distributions
-    target_limb = [p for p in measurements if p.limb in ["Handle", limb_type]]
-    target_limb.sort(key=lambda p: p.position_cm)
-    
-    positions = np.array([p.position_cm for p in target_limb])
-    ei_values = np.array([max(p.ei_nm2, 1e-10) for p in target_limb])
-    thicknesses = np.array([p.thickness_mm / 10.0 for p in target_limb])
-    
-    # High-resolution interpolation for smooth curves
-    s_array = np.linspace(0, limb_length_cm, n_segments)
-    ei_interp = np.interp(s_array, positions, ei_values)
-    thickness_interp = np.interp(s_array, positions, thicknesses)
-    
-    # Get initial profile shape from Side Profile selection
-    x_initial, y_initial = compute_initial_side_profile(s_array, limb_length_cm, side_profile)
-    
-    # Handle special case: Braced state (draw_cm == 0)
-    is_braced = (draw_cm == 0)
-    
-    if draw_cm < 0:
-        # Truly unbraced (negative draw = no string attached)
-        return x_initial, y_initial, thickness_interp
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # PHYSICS ENGINE v5.0: Binary Search on Force
-    # 
-    # Core principle: Forward kinematics preserves arc length BY CONSTRUCTION
-    # (each segment has fixed ds, only direction changes).
-    # Therefore NO post-hoc y-scaling or arc length normalization is needed.
-    # 
-    # Instead, we find the correct FORCE via binary search:
-    #   - Braced: force that makes tip_x = TARGET_BRACE_HEIGHT_CM
-    #   - Drawn: force that makes string_length = string_half_length
-    # 
-    # String vector inversion is prevented by clamping max cumulative angle.
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    s_m = s_array / 100.0
-    limb_m = limb_length_cm / 100.0
-    
-    # Compliance (for initial force estimate / upper bound)
-    integrand = ((limb_m - s_m) ** 2) / ei_interp
-    compliance = np.trapezoid(integrand, s_m)
-    
-    # Side profile config
-    profile_config = SIDE_PROFILE_OPTIONS.get(side_profile, SIDE_PROFILE_OPTIONS["Straight"])
-    
-    # Physical limit: max cumulative bending angle per segment
-    # ~148° prevents tips from inverting past horizontal
-    MAX_CUMULATIVE_ANGLE = np.pi * 0.82
-    
-    def _forward_kinematics(force_n: float) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute limb shape for given applied force.
-        
-        Arc length is preserved by construction:
-        each segment has fixed length ds_cm, only direction changes.
-        """
-        # κ(s) = M(s) / EI(s) = F·(L-s) / EI(s)
-        curvatures = np.zeros(n_segments)
-        for i in range(n_segments):
-            s_local_m = s_array[i] / 100.0
-            moment_arm = limb_m - s_local_m
-            curvatures[i] = force_n * moment_arm / ei_interp[i]
-        
-        # Integrate curvature → cumulative angle
-        angles_fk = np.zeros(n_segments)
-        for i in range(1, n_segments):
-            ds_m = (s_array[i] - s_array[i-1]) / 100.0
-            angles_fk[i] = angles_fk[i-1] + curvatures[i] * ds_m
-            # Clamp to prevent over-bending (physical safety limit)
-            if angles_fk[i] > MAX_CUMULATIVE_ANGLE:
-                angles_fk[i] = MAX_CUMULATIVE_ANGLE
-        
-        # Side profile angle offsets
-        if side_profile == "Reflex":
-            angles_fk += -0.2
-        elif side_profile == "Deflex":
-            angles_fk += 0.15
-        elif side_profile == "Recurve":
-            for i in range(n_segments):
-                s_norm_r = s_array[i] / limb_length_cm
-                if s_norm_r > 0.7:
-                    angles_fk[i] -= 0.4 * ((s_norm_r - 0.7) / 0.3) ** 2
-        
-        # Forward kinematics: each segment has FIXED arc length ds_cm
-        x_fk = np.zeros(n_segments)
-        y_fk = np.zeros(n_segments)
-        x_fk[0] = x_initial[0]
-        y_fk[0] = 0.0
-        
-        for i in range(1, n_segments):
-            ds_cm = s_array[i] - s_array[i-1]
-            direction = np.pi / 2.0 - angles_fk[i - 1]
-            x_fk[i] = x_fk[i-1] + ds_cm * np.cos(direction)
-            y_fk[i] = y_fk[i-1] + ds_cm * np.sin(direction)
-        
-        return x_fk, y_fk
-    
-    if is_braced:
-        # ═══════════════════════════════════════════════════════════════
-        # BRACED STATE: Binary search for force where tip_x = brace height
-        # When tip_x = brace_height, string is vertical at brace height
-        # ═══════════════════════════════════════════════════════════════
-        
-        target_tip_x = TARGET_BRACE_HEIGHT_CM
-        
-        f_low = 0.0
-        f_high = 10.0 / compliance if compliance > 0 else 10000.0
-        
-        # Expand upper bound if needed, but stop if tip_y goes negative
-        x_test_high, y_test_high = _forward_kinematics(f_high)
-        while x_test_high[-1] < target_tip_x and y_test_high[-1] > 2.0 and f_high < 1e8:
-            f_high *= 2.0
-            x_test_high, y_test_high = _forward_kinematics(f_high)
-        
-        best_force = 0.0
-        for _ in range(80):
-            f_mid = (f_low + f_high) / 2.0
-            x_test, y_test = _forward_kinematics(f_mid)
-            current_tip_x = x_test[-1]
-            
-            # Protect: tip must stay above centerline
-            if y_test[-1] < 2.0:
-                f_high = f_mid
-                best_force = f_mid
-                continue
-            
-            if abs(current_tip_x - target_tip_x) < 0.01:
-                best_force = f_mid
-                break
-            
-            if current_tip_x < target_tip_x:
-                f_low = f_mid
-            else:
-                f_high = f_mid
-            
-            best_force = f_mid
-        
-        x_deformed, y_deformed = _forward_kinematics(best_force)
-    
-    else:
-        # ═══════════════════════════════════════════════════════════════
-        # DRAWN STATE: Binary search for force where string length matches
-        # 
-        # String goes from tip (tip_x, tip_y) to nock (draw_cm, 0).
-        # Target: sqrt((tip_x - draw_cm)^2 + tip_y^2) = string_half_length
-        # 
-        # As force increases → more bending → tip closer to nock → shorter string
-        # Binary search finds the exact force for the target string length.
-        # ═══════════════════════════════════════════════════════════════
-        
-        nock_x = draw_cm
-        
-        if string_half_length is not None and string_half_length > 0:
-            f_low = 0.0
-            f_high = max(draw_cm / 100.0, 0.5) / compliance * 5.0 if compliance > 0 else 50000.0
-            
-            # Expand upper bound if needed, but STOP if tip_y goes negative
-            x_h, y_h = _forward_kinematics(f_high)
-            slen_h = np.sqrt((x_h[-1] - nock_x)**2 + y_h[-1]**2)
-            while slen_h > string_half_length and y_h[-1] > 2.0 and f_high < 1e8:
-                f_high *= 2.0
-                x_h, y_h = _forward_kinematics(f_high)
-                slen_h = np.sqrt((x_h[-1] - nock_x)**2 + y_h[-1]**2)
-            
-            best_force = f_low
-            best_diff = float('inf')
-            
-            # Minimum tip_y threshold: tip must stay above centerline
-            MIN_TIP_Y_CM = 2.0
-            
-            for _ in range(80):
-                f_mid = (f_low + f_high) / 2.0
-                x_test, y_test = _forward_kinematics(f_mid)
-                
-                tip_x_t = x_test[-1]
-                tip_y_t = y_test[-1]
-                
-                # CRITICAL: If tip goes below minimum, this force is too high
-                if tip_y_t < MIN_TIP_Y_CM:
-                    f_high = f_mid
-                    continue
-                
-                current_slen = np.sqrt((tip_x_t - nock_x)**2 + tip_y_t**2)
-                diff = current_slen - string_half_length
-                
-                if abs(diff) < abs(best_diff):
-                    best_diff = diff
-                    best_force = f_mid
-                
-                if abs(diff) < 0.02:
-                    break
-                
-                if current_slen > string_half_length:
-                    f_low = f_mid
-                else:
-                    f_high = f_mid
-            
-            x_deformed, y_deformed = _forward_kinematics(best_force)
-        else:
-            # No string constraint: use compliance-based estimate
-            initial_force = (draw_cm / 100.0) / compliance * profile_config["fdc_modifier"] if compliance > 0 else 0.0
-            x_deformed, y_deformed = _forward_kinematics(initial_force)
-    
-    return x_deformed, y_deformed, thickness_interp
+    """Return limb geometry for visualization using the shared physics solver."""
+    state = _solve_limb_deformation_state(
+        measurements=measurements,
+        limb_length_cm=limb_length_cm,
+        draw_cm=draw_cm,
+        side_profile=side_profile,
+        limb_type=limb_type,
+        string_half_length=string_half_length,
+        n_segments=n_segments,
+        draw_from_brace=True,
+    )
+    return (
+        state["x_coords"],        # type: ignore[return-value]
+        state["y_coords"],        # type: ignore[return-value]
+        state["thickness_profile"]  # type: ignore[return-value]
+    )
 
 
 def create_virtual_tiller_realistic(
@@ -2291,7 +2315,7 @@ def create_virtual_tiller_realistic(
                 
             else:
                 # Drawn state: nock point is where arrow rests (pulled back by draw length)
-                nock_x = draw_cm
+                nock_x = TARGET_BRACE_HEIGHT_CM + draw_cm
                 nock_y = 0.0
                 
                 # String: upper tip -> nock -> lower tip
