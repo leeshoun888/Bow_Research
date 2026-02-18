@@ -990,28 +990,34 @@ def calculate_maximum_range(
     v_x = v * math.cos(theta_rad)
     v_y = v * math.sin(theta_rad)
     
-    # Time to reach ground (quadratic formula)
-    # h = h0 + v_y*t - 0.5*g*t²
-    # 0 = launch_height_m + v_y*t - 0.5*g*t²
-    
-    a = -0.5 * GRAVITY
-    b = v_y
-    c = launch_height_m
-    
-    discriminant = b**2 - 4*a*c
-    
-    if discriminant < 0:
+    # Time to reach ground from y(t)=h0+v_y*t-0.5*g*t², choose positive root.
+    t_flight = _solve_projectile_flight_time(v_y, launch_height_m)
+    if t_flight <= 0:
         return 0.0
-    
-    t1 = (-b + math.sqrt(discriminant)) / (2*a)
-    t2 = (-b - math.sqrt(discriminant)) / (2*a)
-    
-    t_flight = max(t1, t2)
     
     # Horizontal range
     range_m = v_x * t_flight
     
     return range_m
+
+
+def _solve_projectile_flight_time(v_y: float, launch_height_m: float) -> float:
+    """Solve positive flight time for projectile from elevated launch."""
+    a = -0.5 * GRAVITY
+    b = v_y
+    c = launch_height_m
+    
+    discriminant = b**2 - 4*a*c
+    if discriminant < 0:
+        return 0.0
+    
+    sqrt_disc = math.sqrt(discriminant)
+    roots = [
+        (-b + sqrt_disc) / (2*a),
+        (-b - sqrt_disc) / (2*a),
+    ]
+    positive_roots = [t for t in roots if t > 0]
+    return max(positive_roots) if positive_roots else 0.0
 
 
 def calculate_effective_range(
@@ -1065,6 +1071,47 @@ def calculate_effective_range(
     return max(0.0, effective_range)
 
 
+def calculate_effective_range_adaptive(
+    arrow_speed_ms: float,
+    arrow_mass_g: float = 25.0,
+    absolute_threshold_j: float = 40.0,
+    fallback_fraction_of_initial: float = 0.35,
+) -> Tuple[float, float, float, bool]:
+    """
+    Compute effective range with adaptive threshold when absolute criterion is unattainable.
+
+    Returns:
+    --------
+    Tuple[float, float, float, bool]
+        (effective_range_m, initial_ke_j, used_threshold_j, used_adaptive_threshold)
+    """
+    if arrow_speed_ms <= 0:
+        return 0.0, 0.0, absolute_threshold_j, False
+    
+    arrow_mass_kg = arrow_mass_g / 1000.0
+    initial_ke_j = 0.5 * arrow_mass_kg * arrow_speed_ms**2
+    
+    if initial_ke_j <= 0:
+        return 0.0, 0.0, absolute_threshold_j, False
+    
+    used_threshold_j = absolute_threshold_j
+    used_adaptive = False
+    
+    if initial_ke_j <= absolute_threshold_j:
+        # Adaptive criterion preserves usefulness for low-energy bows while staying
+        # physically bounded below the launch energy.
+        used_adaptive = True
+        adaptive_candidate = initial_ke_j * fallback_fraction_of_initial
+        used_threshold_j = min(max(adaptive_candidate, 0.5), initial_ke_j * 0.95)
+    
+    effective_range_m = calculate_effective_range(
+        arrow_speed_ms=arrow_speed_ms,
+        arrow_mass_g=arrow_mass_g,
+        min_kinetic_energy_j=used_threshold_j,
+    )
+    return effective_range_m, initial_ke_j, used_threshold_j, used_adaptive
+
+
 def generate_trajectory_points(
     arrow_speed_ms: float,
     launch_angle_deg: float = 45.0,
@@ -1094,17 +1141,10 @@ def generate_trajectory_points(
     v_x = v * math.cos(theta_rad)
     v_y = v * math.sin(theta_rad)
     
-    # Flight time
-    a = -0.5 * GRAVITY
-    b = v_y
-    c = launch_height_m
-    
-    discriminant = b**2 - 4*a*c
-    
-    if discriminant < 0:
+    # Flight time (must use positive root).
+    t_flight = _solve_projectile_flight_time(v_y, launch_height_m)
+    if t_flight <= 0:
         return np.array([0.0]), np.array([launch_height_m])
-    
-    t_flight = (-b + math.sqrt(discriminant)) / (2*a)
     
     # Time array
     t_array = np.linspace(0, t_flight, n_points)
@@ -2538,20 +2578,33 @@ def create_ballistics_trajectory_chart(
         fillcolor='rgba(0, 212, 255, 0.1)',
     ))
     
-    # Effective range trajectory (slightly lower angle for flatter trajectory)
+    # Effective range trajectory reference (35° flatter trajectory)
     x_eff, y_eff = generate_trajectory_points(arrow_speed_ms, 35.0, 1.5, 100)
     
-    # Truncate to effective range
-    mask = x_eff <= effective_range_m
+    # Truncate to effective range; if not available (0), keep a visible reference segment.
+    if effective_range_m > 0:
+        mask = x_eff <= effective_range_m
+    else:
+        fallback_limit = max(1.0, min(max_range_m * 0.35, float(np.max(x_eff)) if len(x_eff) else 1.0))
+        mask = x_eff <= fallback_limit
+    
     x_eff_truncated = x_eff[mask]
     y_eff_truncated = y_eff[mask]
+    
+    if len(x_eff_truncated) == 0:
+        x_eff_truncated = np.array([0.0])
+        y_eff_truncated = np.array([1.5])
     
     fig.add_trace(go.Scatter(
         x=x_eff_truncated,
         y=y_eff_truncated,
         mode='lines',
-        name='유효 사거리 (35°)',
-        line=dict(color='#ffd700', width=3),
+        name='유효 사거리 기준 궤적 (35°)' if effective_range_m > 0 else '참고 궤적 (35°)',
+        line=dict(
+            color='#ffd700' if effective_range_m > 0 else '#999999',
+            width=3 if effective_range_m > 0 else 2,
+            dash='solid' if effective_range_m > 0 else 'dot',
+        ),
     ))
     
     # Launch point
@@ -2622,6 +2675,17 @@ def create_ballistics_trajectory_chart(
             bordercolor='#ffd700',
             borderwidth=1,
         )
+    else:
+        fig.add_annotation(
+            x=max_range_m * 0.45,
+            y=max(y_max) * 0.65 if len(y_max) > 0 else 1.0,
+            text="유효 사거리 기준 미충족<br>(현재 조건에서 0 m)",
+            showarrow=False,
+            font=dict(color='#999999', size=10),
+            bgcolor='rgba(26, 31, 58, 0.8)',
+            bordercolor='#666666',
+            borderwidth=1,
+        )
     
     fig.update_layout(
         title="탄도학: 포물선 궤적 분석",
@@ -2646,7 +2710,7 @@ def create_ballistics_trajectory_chart(
         showgrid=True,
         gridcolor='#2a3f5f',
         gridwidth=1,
-        range=[0, max_range_m * 1.1],
+        range=[0, max(1.0, max_range_m * 1.1)],
     )
     fig.update_yaxes(
         showgrid=True,
@@ -2929,7 +2993,14 @@ def main() -> None:
     # Ballistics calculations
     arrow_speed_ms = arrow_speed_fps * FPS_TO_MS
     max_range_m = calculate_maximum_range(arrow_speed_ms, 45.0, 1.5)
-    effective_range_m = calculate_effective_range(arrow_speed_ms, 25.0, 40.0)
+    effective_range_m, initial_ke_j, effective_ke_threshold_j, used_adaptive_threshold = (
+        calculate_effective_range_adaptive(
+            arrow_speed_ms=arrow_speed_ms,
+            arrow_mass_g=25.0,
+            absolute_threshold_j=40.0,
+            fallback_fraction_of_initial=0.35,
+        )
+    )
     
     # Render results
     render_performance_metrics(metrics)
@@ -2971,7 +3042,7 @@ def main() -> None:
         st.metric(
             label="유효 사거리",
             value=f"{effective_range_m:.1f} m",
-            help="≥40 J 운동 에너지 유지 거리"
+            help=f"유효 기준 에너지 ≥ {effective_ke_threshold_j:.1f} J 유지 거리"
         )
     
     with col3:
@@ -2981,6 +3052,14 @@ def main() -> None:
             value=f"{range_ratio:.0f}%",
             help="전투 효용성 지표"
         )
+    
+    if used_adaptive_threshold:
+        st.caption(
+            f"ℹ️ 초기 운동에너지 {initial_ke_j:.1f} J가 절대 기준 40 J 미만이어서, "
+            f"상대 기준(초기 에너지의 35% = {effective_ke_threshold_j:.1f} J)으로 유효 사거리를 계산했습니다."
+        )
+    else:
+        st.caption(f"ℹ️ 유효 사거리 절대 기준: 최소 운동에너지 40 J (초기 {initial_ke_j:.1f} J)")
     
     fig_ballistics = create_ballistics_trajectory_chart(
         arrow_speed_ms, max_range_m, effective_range_m
