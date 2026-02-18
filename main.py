@@ -229,9 +229,11 @@ class ForceCurvePoint:
     """Single point on the force-draw curve"""
     draw_inch: float
     force_lbs: float
+    # Tip-string interior angle at the limb tip nock (degrees).
     string_angle_deg: float
     tip_deflection_cm: float
     stored_energy_j: float = 0.0
+    # Retained as secondary geometry diagnostic (not plotted in the main angle chart).
     tip_bow_angle_deg: float = 0.0
 
 
@@ -711,7 +713,7 @@ def compute_geometric_fdc(
     )
     
     total_energy_j: List[float] = []
-    mean_string_angle_deg: List[float] = []
+    mean_tip_string_inner_angle_deg: List[float] = []
     mean_tip_bow_angle_deg: List[float] = []
     
     for draw_cm in draw_cm_values:
@@ -739,7 +741,7 @@ def compute_geometric_fdc(
         total_energy_j.append(
             float(upper_state["strain_energy_j"] + lower_state["strain_energy_j"])
         )
-        mean_string_angle_deg.append(
+        mean_tip_string_inner_angle_deg.append(
             0.5 * (upper_state["tip_string_angle_deg"] + lower_state["tip_string_angle_deg"])
         )
         mean_tip_bow_angle_deg.append(
@@ -760,7 +762,7 @@ def compute_geometric_fdc(
         fdc_points.append(ForceCurvePoint(
             draw_inch=float(draw_inch),
             force_lbs=float(force_n[i] * N_TO_LBS),
-            string_angle_deg=float(mean_string_angle_deg[i]),
+            string_angle_deg=float(mean_tip_string_inner_angle_deg[i]),
             tip_deflection_cm=float(draw_cm_values[i]),
             stored_energy_j=float(stored_energy[i]),
             tip_bow_angle_deg=float(mean_tip_bow_angle_deg[i]),
@@ -1793,52 +1795,25 @@ def create_energy_storage_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
 
 
 def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
-    """Visualize string angle and tip-bow angle progression."""
+    """Visualize tip-string interior angle progression."""
     
     draws = [p.draw_inch for p in fdc]
-    angles = [p.string_angle_deg for p in fdc]
-    tip_bow_angles = [p.tip_bow_angle_deg for p in fdc]
+    tip_string_inner_angles = [p.string_angle_deg for p in fdc]
     
     fig = go.Figure()
     
     fig.add_trace(go.Scatter(
         x=draws,
-        y=angles,
+        y=tip_string_inner_angles,
         mode='lines',
-        name='시위 각도',
+        name='Tip-String 내각',
         line=dict(color='#ff6b6b', width=3),
         fill='tozeroy',
         fillcolor='rgba(255, 107, 107, 0.15)',
     ))
     
-    fig.add_trace(go.Scatter(
-        x=draws,
-        y=tip_bow_angles,
-        mode='lines',
-        name='Tip-Bow 각도',
-        line=dict(color='#00d4ff', width=2, dash='dot'),
-    ))
-    
-    # Critical angle indicator (around 45 degrees - high stacking)
-    fig.add_shape(
-        type="line",
-        x0=min(draws), y0=45,
-        x1=max(draws), y1=45,
-        line=dict(color='#ffd700', width=1, dash='dash'),
-    )
-    
-    fig.add_annotation(
-        x=max(draws) * 0.95,
-        y=45,
-        text="임계 각도 (45°)",
-        showarrow=False,
-        font=dict(color='#ffd700', size=9),
-        xanchor='right',
-        yanchor='bottom',
-    )
-    
     fig.update_layout(
-        title="각도 변화 (시위각 / Tip-Bow)",
+        title="각도 변화 (Tip-String 내각)",
         xaxis_title="드로우 길이 (인치)",
         yaxis_title="각도 (도)",
         template="plotly_dark",
@@ -1846,7 +1821,7 @@ def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         plot_bgcolor='#1a1f3a',
         font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
         height=400,
-        showlegend=True,
+        showlegend=False,
     )
     
     fig.update_xaxes(
@@ -2193,9 +2168,12 @@ def _solve_limb_deformation_state(
     
     nock_x_eval = TARGET_BRACE_HEIGHT_CM + max(draw_cm, 0.0) if draw_from_brace else max(draw_cm, 0.0)
     string_dir_rad = math.atan2(-tip_y, nock_x_eval - tip_x)
-    angle_diff_deg = abs(math.degrees(string_dir_rad - tip_tangent_rad))
-    angle_diff_deg = abs(((angle_diff_deg + 180.0) % 360.0) - 180.0)
-    tip_string_angle_deg = min(angle_diff_deg, 180.0 - angle_diff_deg)
+    # Interior angle at tip between:
+    # 1) limb tangent directed toward handle (inward ray from tip)
+    # 2) string segment directed from tip to nock
+    tip_limb_inward_rad = tip_tangent_rad + math.pi
+    tip_string_angle_deg = abs(math.degrees(string_dir_rad - tip_limb_inward_rad))
+    tip_string_angle_deg = abs(((tip_string_angle_deg + 180.0) % 360.0) - 180.0)
     
     point_bending_deg: Dict[int, float] = {}
     for p in target_limb:
