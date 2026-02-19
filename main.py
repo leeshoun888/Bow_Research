@@ -165,6 +165,24 @@ TARGET_BRACE_HEIGHT_CM = 17.0  # Standard brace height for Korean traditional bo
 INTEGRATION_STEPS = 300
 FDC_DRAW_STEPS = 100  # Force-Draw Curve resolution
 
+# String-angle / stacking model parameters
+# Reference rationale (implemented as engineering approximations):
+# - VirtualBow Theory Manual: non-linear FDC and efficiency losses are strongly
+#   linked to string/limb kinematics and energy partition at release.
+# - Kooi-style mechanics: draw force is governed by force equilibrium and
+#   geometry-dependent transmission between string tension and nock force.
+TIP_STRING_STACK_REF_DEG = 95.0
+TIP_STRING_STACK_CRIT_DEG = 120.0
+MIN_TIP_STRING_SIN = math.sin(math.radians(8.0))
+
+# Efficiency penalties from late-draw stacking concentration.
+STACK_EFF_ANGLE_WEIGHT = 0.22
+STACK_EFF_LATE_WORK_WEIGHT = 0.14
+STACK_EFF_MIN_FACTOR = 0.70
+
+# Blend between geometry-transmission force and energy-derivative force.
+GEOMETRIC_FORCE_BLEND = 0.80
+
 # ════════════════════════════════════════════════════════════════════════════
 # 7-POINT MEASUREMENT DEFINITIONS
 # ════════════════════════════════════════════════════════════════════════════
@@ -575,6 +593,46 @@ def compute_string_angle(
     return abs(angle_deg)
 
 
+def _integrate_force_curve(draw_m_values: np.ndarray, force_n: np.ndarray) -> np.ndarray:
+    """Cumulative work integral U(x)=∫F dx from a force curve."""
+    n = len(draw_m_values)
+    if n == 0:
+        return np.array([], dtype=float)
+    if n == 1:
+        return np.array([0.0], dtype=float)
+    
+    dx = np.diff(draw_m_values)
+    trap = 0.5 * (force_n[1:] + force_n[:-1]) * dx
+    cumulative = np.zeros(n, dtype=float)
+    cumulative[1:] = np.cumsum(trap)
+    return np.maximum(cumulative, 0.0)
+
+
+def _smooth_force_curve(
+    draw_m_values: np.ndarray,
+    force_n: np.ndarray,
+    target_end_energy_j: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Smooth force curve while preserving monotonic draw-force behavior and
+    optionally matching terminal stored energy.
+    """
+    if len(draw_m_values) != len(force_n):
+        return np.zeros_like(draw_m_values)
+    
+    force_clamped = np.maximum(np.asarray(force_n, dtype=float), 0.0)
+    pseudo_energy = _integrate_force_curve(draw_m_values, force_clamped)
+    smoothed = _estimate_force_from_energy(draw_m_values, pseudo_energy)
+    
+    if target_end_energy_j is None:
+        return smoothed
+    
+    area = float(np.trapezoid(smoothed, draw_m_values))
+    if area > 1e-12 and target_end_energy_j > 0:
+        smoothed *= target_end_energy_j / area
+    return np.maximum(smoothed, 0.0)
+
+
 def _estimate_force_from_energy(
     draw_m_values: np.ndarray,
     stored_energy_j: np.ndarray,
@@ -713,6 +771,7 @@ def compute_geometric_fdc(
     )
     
     total_energy_j: List[float] = []
+    geometric_draw_force_n: List[float] = []
     mean_tip_string_inner_angle_deg: List[float] = []
     mean_tip_bow_angle_deg: List[float] = []
     
@@ -741,6 +800,12 @@ def compute_geometric_fdc(
         total_energy_j.append(
             float(upper_state["strain_energy_j"] + lower_state["strain_energy_j"])
         )
+        geometric_draw_force_n.append(
+            float(
+                upper_state["applied_force_n"] * upper_state["draw_force_gain"]
+                + lower_state["applied_force_n"] * lower_state["draw_force_gain"]
+            )
+        )
         mean_tip_string_inner_angle_deg.append(
             0.5 * (upper_state["tip_string_angle_deg"] + lower_state["tip_string_angle_deg"])
         )
@@ -750,12 +815,46 @@ def compute_geometric_fdc(
     
     # Stored energy baseline is the braced state (draw = 0).
     energy_array = np.array(total_energy_j, dtype=float)
-    stored_energy = np.maximum(energy_array - energy_array[0], 0.0)
+    stored_energy_from_strain = np.maximum(energy_array - energy_array[0], 0.0)
     # Numerical safety: enforce non-decreasing stored energy with draw.
-    stored_energy = np.maximum.accumulate(stored_energy)
+    stored_energy_from_strain = np.maximum.accumulate(stored_energy_from_strain)
+    end_energy = float(stored_energy_from_strain[-1]) if len(stored_energy_from_strain) else 0.0
     
-    # Draw force from smoothed local derivative of stored energy.
-    force_n = _estimate_force_from_energy(draw_m_values, stored_energy)
+    # Baseline force from energy derivative (stable fallback).
+    force_from_energy = _estimate_force_from_energy(draw_m_values, stored_energy_from_strain)
+    
+    # Geometry-transmission force: directly couples draw force to string/tip angles.
+    geometric_force = np.maximum(np.array(geometric_draw_force_n, dtype=float), 0.0)
+    force_n = force_from_energy.copy()
+    
+    if len(geometric_force) == len(draw_m_values) and np.any(geometric_force > 0):
+        area_geo = float(np.trapezoid(geometric_force, draw_m_values))
+        if area_geo > 1e-12 and end_energy > 0:
+            geometric_force *= end_energy / area_geo
+        
+        geometric_force = _smooth_force_curve(
+            draw_m_values,
+            geometric_force,
+            target_end_energy_j=end_energy if end_energy > 0 else None,
+        )
+        
+        # Blend to keep robustness near degenerate geometries while preserving
+        # strong angle-driven stacking behavior.
+        force_n = (
+            GEOMETRIC_FORCE_BLEND * geometric_force
+            + (1.0 - GEOMETRIC_FORCE_BLEND) * force_from_energy
+        )
+        
+        # Final consistency scaling to terminal strain energy.
+        area_final = float(np.trapezoid(force_n, draw_m_values))
+        if area_final > 1e-12 and end_energy > 0:
+            force_n *= end_energy / area_final
+    
+    force_n = np.maximum(force_n, 0.0)
+    force_n = np.maximum.accumulate(force_n)
+    stored_energy = _integrate_force_curve(draw_m_values, force_n)
+    if len(stored_energy) and end_energy > 0 and stored_energy[-1] > 1e-12:
+        stored_energy *= end_energy / stored_energy[-1]
     
     fdc_points: List[ForceCurvePoint] = []
     for i, draw_inch in enumerate(draw_inches):
@@ -773,15 +872,13 @@ def compute_geometric_fdc(
 
 def find_stacking_point(fdc: List[ForceCurvePoint], threshold_ratio: float = 1.5) -> Optional[float]:
     """
-    Identify stacking point: where force increase rate exceeds threshold
-    
-    Stacking = d²F/dx² > threshold
+    Identify stacking point from force-rate acceleration + string-angle criterion.
     
     Parameters:
     -----------
     fdc : List[ForceCurvePoint]
     threshold_ratio : float
-        Second derivative threshold
+        Relative threshold multiplier on force-rate
     
     Returns:
     --------
@@ -790,22 +887,39 @@ def find_stacking_point(fdc: List[ForceCurvePoint], threshold_ratio: float = 1.5
     if len(fdc) < 3:
         return None
     
-    draws = np.array([p.draw_inch for p in fdc])
-    forces = np.array([p.force_lbs for p in fdc])
+    draws = np.array([p.draw_inch for p in fdc], dtype=float)
+    forces = np.array([p.force_lbs for p in fdc], dtype=float)
+    angles = np.array([p.string_angle_deg for p in fdc], dtype=float)
     
-    # First derivative (force rate)
     dF_dx = np.gradient(forces, draws)
-    
-    # Second derivative (acceleration)
     d2F_dx2 = np.gradient(dF_dx, draws)
     
-    # Find where second derivative exceeds threshold
-    mean_d2F = np.mean(np.abs(d2F_dx2[1:-1]))
+    draw_max = float(np.max(draws))
+    if draw_max <= 0:
+        return None
     
+    # Baseline force-rate in early/mid draw.
+    baseline_mask = draws <= draw_max * 0.55
+    baseline_rate = float(np.median(dF_dx[baseline_mask])) if np.any(baseline_mask) else float(np.median(dF_dx))
+    baseline_rate = max(baseline_rate, 1e-9)
+    
+    # Angle-aware criterion: stacking should emerge in late draw where
+    # tip-string interior angle has grown beyond reference region.
+    for i in range(len(draws)):
+        if draws[i] < draw_max * 0.55:
+            continue
+        if angles[i] < TIP_STRING_STACK_REF_DEG:
+            continue
+        if dF_dx[i] > threshold_ratio * baseline_rate and d2F_dx2[i] > 0:
+            return float(draws[i])
+    
+    # Fallback for edge cases: pure curvature criterion in latter half.
+    mean_d2F = float(np.mean(np.abs(d2F_dx2[1:-1]))) if len(d2F_dx2) > 2 else 0.0
+    if mean_d2F <= 0:
+        return None
     for i, val in enumerate(d2F_dx2):
-        if i > len(d2F_dx2) // 2:  # Only check latter half
-            if abs(val) > threshold_ratio * mean_d2F:
-                return draws[i]
+        if draws[i] >= draw_max * 0.55 and abs(val) > threshold_ratio * mean_d2F:
+            return float(draws[i])
     
     return None
 
@@ -846,7 +960,8 @@ def calculate_stored_energy(fdc: List[ForceCurvePoint]) -> float:
 def calculate_shooting_efficiency(
     measurements: List[MeasurementPoint],
     segment_masses_g: List[float],
-    total_mass_g: float
+    total_mass_g: float,
+    fdc: Optional[List[ForceCurvePoint]] = None,
 ) -> float:
     """
     Calculate shooting efficiency (energy transfer ratio)
@@ -866,6 +981,13 @@ def calculate_shooting_efficiency(
     - Handle: k ≈ 0.1 (minimal motion)
     
     Efficiency = 1 / (1 + M_virtual/M_arrow)
+    
+    Additional dynamic correction:
+    - High tip-string interior angle in late draw increases string/limb
+      kinetic-energy share and practical stack severity.
+    - We model this with a bounded penalty based on:
+      (a) late-draw angle excess over a reference region
+      (b) late-draw work concentration (stack-heavy FDC shape)
     
     Parameters:
     -----------
@@ -906,8 +1028,39 @@ def calculate_shooting_efficiency(
     # Standard arrow mass
     arrow_mass_g = 25.0
     
-    # Efficiency
+    # Base mass-driven efficiency
     efficiency = arrow_mass_g / (arrow_mass_g + virtual_mass_g)
+    
+    if fdc and len(fdc) > 4:
+        draws = np.array([p.draw_inch for p in fdc], dtype=float)
+        forces_n = np.array([p.force_lbs * LBS_TO_N for p in fdc], dtype=float)
+        angles = np.array([p.string_angle_deg for p in fdc], dtype=float)
+        
+        draw_max = float(np.max(draws))
+        if draw_max > 0 and np.any(forces_n > 0):
+            # Late-draw weighted angle excess (stacking-sensitive region).
+            draw_norm = draws / draw_max
+            late_weights = np.clip((draw_norm - 0.5) / 0.5, 0.0, 1.0) + 0.15
+            angle_excess = np.maximum(angles - TIP_STRING_STACK_REF_DEG, 0.0)
+            angle_excess /= max(TIP_STRING_STACK_CRIT_DEG - TIP_STRING_STACK_REF_DEG, 1e-9)
+            angle_excess = np.clip(angle_excess, 0.0, 1.0)
+            weighted_angle_excess = float(np.average(angle_excess, weights=late_weights))
+            
+            # Work concentration in last quarter of draw:
+            # linear-force baseline gives ~43.75% in last quarter.
+            total_work = float(np.trapezoid(forces_n, draws * INCH_TO_M))
+            late_start = 0.75 * draw_max
+            late_mask = draws >= late_start
+            late_work = float(np.trapezoid(forces_n[late_mask], draws[late_mask] * INCH_TO_M)) if np.any(late_mask) else 0.0
+            late_ratio = (late_work / total_work) if total_work > 1e-9 else 0.0
+            late_ratio_excess = max(0.0, (late_ratio - 0.4375) / (1.0 - 0.4375))
+            
+            stack_penalty = (
+                STACK_EFF_ANGLE_WEIGHT * weighted_angle_excess
+                + STACK_EFF_LATE_WORK_WEIGHT * late_ratio_excess
+            )
+            dynamic_factor = max(STACK_EFF_MIN_FACTOR, 1.0 - stack_penalty)
+            efficiency *= dynamic_factor
     
     # Clamp to reasonable range
     efficiency = max(0.2, min(0.9, efficiency))
@@ -1252,226 +1405,367 @@ def simulate_tillering_at_draw(
 
 
 def apply_museum_dark_theme() -> None:
-    """Apply museum-grade dark mode research dashboard theme"""
+    """Apply refined museum-style dark interface inspired by experimental archaeology."""
     st.markdown("""
         <style>
-        /* Museum Dark Mode: Deep Navy & Charcoal Foundation */
+        @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+        :root {
+            --bg-deep: #111317;
+            --bg-panel: #1a1d23;
+            --bg-elev: #20242b;
+            --line: #3a3d42;
+            --text-main: #e7e1d5;
+            --text-muted: #b9b3a8;
+            --accent-brass: #c8a86b;
+            --accent-oxide: #b8644a;
+            --accent-patina: #6ea7a5;
+        }
+
         .stApp {
-            background: linear-gradient(180deg, #0a0e27 0%, #121212 50%, #0a0e27 100%);
-            font-family: 'Inter', 'SF Pro Display', -apple-system, sans-serif;
-            color: #E0E0E0;
+            background:
+                radial-gradient(1200px 500px at 12% -15%, rgba(200, 168, 107, 0.14), transparent 58%),
+                radial-gradient(900px 460px at 88% 110%, rgba(110, 167, 165, 0.12), transparent 55%),
+                linear-gradient(175deg, #0f1115 0%, var(--bg-deep) 45%, #14171c 100%);
+            font-family: 'IBM Plex Sans', sans-serif;
+            color: var(--text-main);
         }
-        
+
         .block-container {
-            padding-top: 2rem;
+            padding-top: 1.8rem;
             padding-bottom: 3rem;
-            max-width: 1600px;
+            max-width: 1520px;
         }
-        
-        /* Sidebar: Archive Drawer Style */
+
         [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #1a1f3a 0%, #0d111f 100%);
-            border-right: 1px solid #2a3f5f;
-            box-shadow: 4px 0 20px rgba(0, 0, 0, 0.5);
+            background:
+                linear-gradient(190deg, #171a20 0%, #13161b 55%, #111317 100%);
+            border-right: 1px solid var(--line);
+            box-shadow: 8px 0 28px rgba(0, 0, 0, 0.45);
         }
-        
+
         [data-testid="stSidebar"] .stMarkdown {
-            color: #E0E0E0;
+            color: var(--text-main);
         }
-        
-        /* Typography: Museum Exhibition Labels */
+
         h1 {
-            color: #00d4ff !important;
+            color: var(--text-main) !important;
+            font-family: 'Cormorant Garamond', serif !important;
             font-weight: 700 !important;
-            font-size: 2.5rem !important;
-            letter-spacing: 0.05em !important;
-            text-transform: uppercase !important;
-            border-bottom: 2px solid #ffd700 !important;
-            padding-bottom: 1rem !important;
-            margin-bottom: 2rem !important;
-            text-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
+            font-size: clamp(2rem, 2.4vw, 3rem) !important;
+            letter-spacing: 0.045em !important;
+            text-transform: none !important;
+            border-bottom: 1px solid var(--line) !important;
+            padding-bottom: 0.9rem !important;
+            margin-bottom: 1.35rem !important;
+            position: relative;
         }
-        
+
+        h1::after {
+            content: "";
+            position: absolute;
+            left: 0;
+            bottom: -1px;
+            width: 11rem;
+            height: 2px;
+            background: linear-gradient(90deg, var(--accent-brass), var(--accent-patina));
+        }
+
         h2 {
-            color: #ffd700 !important;
+            color: var(--accent-brass) !important;
+            font-family: 'Cormorant Garamond', serif !important;
             font-weight: 600 !important;
-            font-size: 1.5rem !important;
-            letter-spacing: 0.08em !important;
-            text-transform: uppercase !important;
-            margin-top: 3rem !important;
-            margin-bottom: 1.5rem !important;
-            border-left: 4px solid #00d4ff !important;
-            padding-left: 1rem !important;
+            font-size: clamp(1.3rem, 1.55vw, 1.9rem) !important;
+            letter-spacing: 0.04em !important;
+            text-transform: none !important;
+            margin-top: 2.4rem !important;
+            margin-bottom: 1.15rem !important;
+            border-left: 3px solid var(--accent-patina) !important;
+            padding-left: 0.85rem !important;
         }
-        
+
         h3 {
-            color: #B0B0B0 !important;
-            font-weight: 500 !important;
-            font-size: 1.1rem !important;
-            letter-spacing: 0.05em !important;
-            margin-top: 1.5rem !important;
+            color: var(--text-muted) !important;
+            font-weight: 600 !important;
+            font-size: 1.04rem !important;
+            letter-spacing: 0.03em !important;
         }
-        
-        /* Metric Cards: Illuminated Display Panels */
-        [data-testid="stMetricValue"] {
-            color: #00d4ff !important;
-            font-size: 2.5rem !important;
-            font-weight: 700 !important;
-            font-family: 'JetBrains Mono', 'Courier New', monospace !important;
-            text-shadow: 0 0 15px rgba(0, 212, 255, 0.5);
-        }
-        
-        [data-testid="stMetricLabel"] {
-            color: #B0B0B0 !important;
-            font-size: 0.75rem !important;
-            text-transform: uppercase !important;
-            letter-spacing: 0.15em !important;
-            font-weight: 500 !important;
-        }
-        
+
         [data-testid="stMetric"] {
-            background: linear-gradient(135deg, #1a1f3a 0%, #0d111f 100%);
-            border: 1px solid #2a3f5f;
-            border-radius: 8px;
-            padding: 1.5rem 1rem;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+            background: linear-gradient(150deg, rgba(41, 46, 55, 0.78), rgba(22, 25, 31, 0.9));
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 1.2rem 1rem;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
         }
-        
-        /* Input Fields: Technical Instrument Style */
-        .stNumberInput input, .stSelectbox select {
-            background-color: #1a1f3a !important;
-            border: 1px solid #2a3f5f !important;
-            color: #E0E0E0 !important;
-            border-radius: 6px !important;
-            font-family: 'JetBrains Mono', monospace !important;
+
+        [data-testid="stMetricValue"] {
+            color: var(--accent-patina) !important;
+            font-family: 'IBM Plex Mono', monospace !important;
+            font-size: 2.2rem !important;
+            font-weight: 600 !important;
+            letter-spacing: 0.02em !important;
         }
-        
-        .stNumberInput input:focus, .stSelectbox select:focus {
-            border-color: #00d4ff !important;
-            box-shadow: 0 0 10px rgba(0, 212, 255, 0.3) !important;
-        }
-        
-        .stNumberInput label, .stSelectbox label {
-            color: #B0B0B0 !important;
+
+        [data-testid="stMetricLabel"] {
+            color: var(--text-muted) !important;
+            font-size: 0.76rem !important;
+            letter-spacing: 0.13em !important;
+            text-transform: uppercase !important;
             font-weight: 500 !important;
-            font-size: 0.85rem !important;
-            letter-spacing: 0.05em !important;
-            text-transform: uppercase !important;
         }
-        
-        /* Slider: Precision Control */
-        .stSlider label {
-            color: #B0B0B0 !important;
-            font-weight: 600 !important;
-            letter-spacing: 0.05em !important;
+
+        .stNumberInput input, .stSelectbox select {
+            background-color: var(--bg-panel) !important;
+            border: 1px solid var(--line) !important;
+            color: var(--text-main) !important;
+            border-radius: 8px !important;
+            font-family: 'IBM Plex Mono', monospace !important;
         }
-        
-        /* Expander: Archive Drawer */
+
+        .stNumberInput input:focus, .stSelectbox select:focus {
+            border-color: var(--accent-patina) !important;
+            box-shadow: 0 0 0 2px rgba(110, 167, 165, 0.18) !important;
+        }
+
+        .stNumberInput label, .stSelectbox label, .stSlider label {
+            color: var(--text-muted) !important;
+            font-weight: 500 !important;
+            font-size: 0.84rem !important;
+            letter-spacing: 0.04em !important;
+        }
+
         .streamlit-expanderHeader {
-            background: linear-gradient(90deg, #1a1f3a 0%, #0d111f 100%) !important;
-            border: 1px solid #2a3f5f !important;
-            border-radius: 6px !important;
-            color: #E0E0E0 !important;
+            background: linear-gradient(90deg, #20252d 0%, #181c23 100%) !important;
+            border: 1px solid var(--line) !important;
+            border-radius: 8px !important;
+            color: var(--text-main) !important;
             font-weight: 600 !important;
-            letter-spacing: 0.05em !important;
+            letter-spacing: 0.03em !important;
         }
-        
+
         .streamlit-expanderHeader:hover {
-            background: linear-gradient(90deg, #2a3f5f 0%, #1a1f3a 100%) !important;
-            border-color: #00d4ff !important;
+            border-color: var(--accent-patina) !important;
         }
-        
+
         .streamlit-expanderContent {
-            background-color: #0d111f !important;
-            border: 1px solid #2a3f5f !important;
+            background-color: #14181f !important;
+            border: 1px solid var(--line) !important;
             border-top: none !important;
-            border-radius: 0 0 6px 6px !important;
+            border-radius: 0 0 8px 8px !important;
         }
-        
-        /* Dataframe: Digital Archive Table */
+
         .dataframe {
-            font-size: 0.85rem !important;
-            border-collapse: collapse !important;
-            background-color: #0d111f !important;
+            font-size: 0.84rem !important;
+            background-color: #12161d !important;
         }
-        
+
         .dataframe th {
-            background: linear-gradient(180deg, #1a1f3a 0%, #0d111f 100%) !important;
-            color: #ffd700 !important;
+            background: linear-gradient(180deg, #232933 0%, #191d25 100%) !important;
+            color: var(--accent-brass) !important;
+            border-bottom: 1px solid var(--line) !important;
             font-weight: 600 !important;
-            border-bottom: 2px solid #2a3f5f !important;
-            padding: 0.75rem !important;
-            text-transform: uppercase !important;
-            letter-spacing: 0.05em !important;
+            letter-spacing: 0.04em !important;
         }
-        
+
         .dataframe td {
-            border-bottom: 1px solid #2a3f5f !important;
-            padding: 0.6rem 0.75rem !important;
-            color: #E0E0E0 !important;
+            border-bottom: 1px solid #2f3339 !important;
+            color: var(--text-main) !important;
         }
-        
-        /* Caption: Museum Label */
+
         .caption {
-            color: #808080;
+            color: #8e877b;
             font-size: 0.8rem;
-            font-style: italic;
-            margin-top: 0.5rem;
-            letter-spacing: 0.03em;
+            letter-spacing: 0.02em;
         }
-        
-        /* Strategic Metallic Accents */
+
         .cyan-accent {
-            color: #00d4ff;
-            font-weight: 700;
-            text-shadow: 0 0 10px rgba(0, 212, 255, 0.4);
+            color: var(--accent-patina);
+            font-weight: 600;
         }
-        
+
         .gold-accent {
-            color: #ffd700;
-            font-weight: 700;
-            text-shadow: 0 0 10px rgba(255, 215, 0, 0.4);
+            color: var(--accent-brass);
+            font-weight: 600;
         }
-        
+
         .critical-value {
-            color: #ff6b6b;
+            color: var(--accent-oxide);
             font-weight: 700;
         }
-        
-        /* Dividers: Light Beam */
+
         hr {
             border: none;
             height: 1px;
-            background: linear-gradient(90deg, transparent, #2a3f5f, transparent);
-            margin: 3rem 0;
-            box-shadow: 0 0 10px rgba(42, 63, 95, 0.5);
+            background: linear-gradient(90deg, transparent, var(--line), transparent);
+            margin: 2.6rem 0;
         }
-        
-        /* Section Cards */
+
         .section-card {
-            background: linear-gradient(135deg, #1a1f3a 0%, #0d111f 100%);
-            border: 1px solid #2a3f5f;
+            background: linear-gradient(150deg, #1f242c 0%, #151920 100%);
+            border: 1px solid var(--line);
             border-radius: 12px;
-            padding: 2rem;
-            margin: 2rem 0;
-            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+            padding: 1.8rem;
+            margin: 1.8rem 0;
         }
-        
-        /* Geometric Line Decorations */
+
         .geometric-line {
             width: 100%;
-            height: 2px;
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                #00d4ff 20%, 
-                #ffd700 50%, 
-                #00d4ff 80%, 
-                transparent 100%);
-            margin: 1.5rem 0;
-            box-shadow: 0 0 15px rgba(0, 212, 255, 0.3);
+            height: 1px;
+            background: linear-gradient(
+                90deg,
+                transparent 0%,
+                rgba(200, 168, 107, 0.75) 22%,
+                rgba(110, 167, 165, 0.75) 50%,
+                rgba(200, 168, 107, 0.75) 78%,
+                transparent 100%
+            );
+            margin: 1.3rem 0;
+        }
+
+        .hero-shell {
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 1.3rem 1.25rem 1.15rem 1.25rem;
+            background:
+                radial-gradient(440px 140px at 0% 0%, rgba(200, 168, 107, 0.16), transparent 72%),
+                linear-gradient(155deg, rgba(41, 47, 56, 0.86), rgba(20, 24, 31, 0.92));
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.30);
+            margin-bottom: 1.1rem;
+        }
+
+        .hero-kicker {
+            color: var(--accent-brass);
+            font-size: 0.72rem;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            font-weight: 600;
+            margin-bottom: 0.35rem;
+        }
+
+        .hero-title {
+            color: var(--text-main);
+            font-family: 'Cormorant Garamond', serif;
+            font-weight: 700;
+            font-size: clamp(2rem, 3vw, 3.2rem);
+            line-height: 1.03;
+            letter-spacing: 0.02em;
+            margin: 0;
+        }
+
+        .hero-sub {
+            color: var(--text-muted);
+            margin-top: 0.45rem;
+            margin-bottom: 0;
+            font-size: 0.94rem;
+            letter-spacing: 0.025em;
+        }
+
+        .section-banner {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 1rem;
+            border-bottom: 1px solid var(--line);
+            margin-top: 1.45rem;
+            margin-bottom: 0.9rem;
+            padding-bottom: 0.45rem;
+        }
+
+        .section-banner-title {
+            color: var(--accent-brass);
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 1.6rem;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            margin: 0;
+        }
+
+        .section-banner-sub {
+            color: #9a9487;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            white-space: nowrap;
+            margin-bottom: 0.08rem;
+        }
+
+        [data-testid="stPlotlyChart"] {
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 0.2rem 0.2rem 0 0.2rem;
+            background: linear-gradient(160deg, rgba(38, 43, 52, 0.78), rgba(20, 24, 30, 0.9));
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.26);
+        }
+
+        [data-testid="stDataFrame"] {
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            overflow: hidden;
+            background: #131820;
+        }
+
+        @keyframes riseIn {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        [data-testid="stMetric"],
+        [data-testid="stPlotlyChart"],
+        [data-testid="stDataFrame"] {
+            animation: riseIn 0.45s ease both;
+        }
+
+        @media (max-width: 900px) {
+            .block-container {
+                padding-top: 1.1rem;
+            }
+            h1 {
+                letter-spacing: 0.03em !important;
+            }
+            .section-banner {
+                display: block;
+            }
+            .section-banner-sub {
+                margin-top: 0.3rem;
+                white-space: normal;
+            }
         }
         </style>
     """, unsafe_allow_html=True)
+
+
+def render_hero_header() -> None:
+    """Render refined museum-style hero header."""
+    st.markdown(
+        """
+        <div class="hero-shell">
+            <div class="hero-kicker">Experimental Archaeology · Bow Laboratory</div>
+            <h1 class="hero-title">디지털 활 물리 & 탄도 연구소</h1>
+            <p class="hero-sub">Museum-grade interactive research platform for traditional bow mechanics and ballistics</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_banner(title: str, subtitle: str) -> None:
+    """Render section banner with title and contextual subtitle."""
+    st.markdown(
+        f"""
+        <div class="section-banner">
+            <div class="section-banner-title">{title}</div>
+            <div class="section-banner-sub">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_sidebar_inputs() -> Tuple[str, float, str, List[MeasurementPoint]]:
@@ -1484,7 +1778,7 @@ def render_sidebar_inputs() -> Tuple[str, float, str, List[MeasurementPoint]]:
         (wood_species, total_length_cm, side_profile, measurements)
     """
     with st.sidebar:
-        st.markdown("## ═══ 활 제원 설정 ═══")
+        st.markdown("## 활 제원 설정")
         st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
         
         # Wood selection
@@ -1509,7 +1803,7 @@ def render_sidebar_inputs() -> Tuple[str, float, str, List[MeasurementPoint]]:
         st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
         
         # Side Profile Selection
-        st.markdown("### 사이드 프로파일 (초기 형상)")
+        st.markdown("### 사이드 프로파일")
         
         side_profile = st.selectbox(
             "프로파일 유형",
@@ -1525,7 +1819,7 @@ def render_sidebar_inputs() -> Tuple[str, float, str, List[MeasurementPoint]]:
         st.caption(f"스택킹 배율: {profile_info['stacking_modifier']:.2f}x")
         
         st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
-        st.markdown("## ═══ 7개 지점 측정값 ═══")
+        st.markdown("## 7개 지점 측정값")
         st.caption("정밀 기하학적 프로파일 및 측면 각도 입력")
         
         # Calculate positions
@@ -1610,7 +1904,7 @@ def render_sidebar_inputs() -> Tuple[str, float, str, List[MeasurementPoint]]:
 def render_performance_metrics(metrics: PerformanceMetrics) -> None:
     """Render key performance metrics - Museum Display Style"""
     
-    st.markdown("## ═══ 성능 분석 ═══")
+    render_section_banner("성능 분석", "Material response · Energy transfer · Shooting efficiency")
     
     # Primary metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -1648,19 +1942,19 @@ def render_performance_metrics(metrics: PerformanceMetrics) -> None:
         )
         st.caption("그램 (g)")
     
-    st.markdown("")
+    st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
     # Arrow velocity metrics
     col1, col2, col3 = st.columns(3)
     
     with col1:
         st.markdown('<p class="cyan-accent" style="font-size: 0.85rem; margin-bottom: 0.3rem;">화살 속도</p>', unsafe_allow_html=True)
-        st.markdown(f'<p style="font-size: 2rem; font-weight: 700; color: #00d4ff; margin: 0;">{metrics.arrow_speed_fps:.1f}</p>', unsafe_allow_html=True)
+        st.markdown(f'<p style="font-size: 2rem; font-weight: 700; color: #6ea7a5; margin: 0;">{metrics.arrow_speed_fps:.1f}</p>', unsafe_allow_html=True)
         st.caption("피트/초 (FPS)")
     
     with col2:
         st.markdown('<p class="gold-accent" style="font-size: 0.85rem; margin-bottom: 0.3rem;">화살 속도</p>', unsafe_allow_html=True)
-        st.markdown(f'<p style="font-size: 2rem; font-weight: 700; color: #ffd700; margin: 0;">{metrics.arrow_speed_kmh:.1f}</p>', unsafe_allow_html=True)
+        st.markdown(f'<p style="font-size: 2rem; font-weight: 700; color: #c8a86b; margin: 0;">{metrics.arrow_speed_kmh:.1f}</p>', unsafe_allow_html=True)
         st.caption("킬로미터/시 (km/h)")
     
     with col3:
@@ -1674,10 +1968,10 @@ def render_performance_metrics(metrics: PerformanceMetrics) -> None:
     # Stacking warning
     if metrics.stacking_point_inch is not None:
         st.markdown(f"""
-            <div style='background: linear-gradient(90deg, rgba(255, 107, 107, 0.2), transparent); 
-                        border-left: 4px solid #ff6b6b; padding: 1rem; margin-top: 1rem; border-radius: 4px;'>
-                <span style='color: #ff6b6b; font-weight: 700;'>⚠ 스택킹 감지</span><br>
-                <span style='color: #E0E0E0;'>드로우 {metrics.stacking_point_inch:.1f}인치부터 급격한 힘 증가 시작</span>
+            <div style='background: linear-gradient(90deg, rgba(184, 100, 74, 0.2), transparent); 
+                        border-left: 4px solid #b8644a; padding: 1rem; margin-top: 1rem; border-radius: 4px;'>
+                <span style='color: #b8644a; font-weight: 700;'>⚠ 스택킹 감지</span><br>
+                <span style='color: #e7e1d5;'>드로우 {metrics.stacking_point_inch:.1f}인치부터 급격한 힘 증가 시작</span>
             </div>
         """, unsafe_allow_html=True)
 
@@ -1696,9 +1990,9 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         y=forces,
         mode='lines',
         name='장력-드로우 곡선',
-        line=dict(color='#00d4ff', width=3),
+        line=dict(color='#6ea7a5', width=3),
         fill='tozeroy',
-        fillcolor='rgba(0, 212, 255, 0.15)',
+        fillcolor='rgba(110, 167, 165, 0.15)',
     ))
     
     # Highlight 28" point
@@ -1708,7 +2002,7 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         y=[forces[idx_28]],
         mode='markers',
         name='28인치 드로우 지점',
-        marker=dict(color='#ffd700', size=15, symbol='diamond', line=dict(color='#fff', width=2)),
+        marker=dict(color='#c8a86b', size=15, symbol='diamond', line=dict(color='#fff', width=2)),
     ))
     
     # Add vertical line at 28"
@@ -1716,7 +2010,7 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         type="line",
         x0=28, y0=0,
         x1=28, y1=forces[idx_28],
-        line=dict(color='#ffd700', width=2, dash='dash'),
+        line=dict(color='#c8a86b', width=2, dash='dash'),
     )
     
     fig.update_layout(
@@ -1724,15 +2018,15 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         xaxis_title="드로우 길이 (인치)",
         yaxis_title="장력 (파운드)",
         template="plotly_dark",
-        paper_bgcolor='#0d111f',
-        plot_bgcolor='#1a1f3a',
-        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        paper_bgcolor='#111317',
+        plot_bgcolor='#1a1d23',
+        font=dict(family="IBM Plex Sans, sans-serif", size=12, color="#e7e1d5"),
         showlegend=True,
         legend=dict(
             x=0.02,
             y=0.98,
-            bgcolor='rgba(26, 31, 58, 0.8)',
-            bordercolor='#2a3f5f',
+            bgcolor='rgba(24, 28, 34, 0.82)',
+            bordercolor='#3a3d42',
             borderwidth=1
         ),
         height=500,
@@ -1740,12 +2034,12 @@ def create_fdc_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
     
     fig.update_xaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     fig.update_yaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     
@@ -1763,9 +2057,9 @@ def create_energy_storage_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         y=energies,
         mode='lines',
         name='저장 에너지 U(d)',
-        line=dict(color='#ffd700', width=3),
+        line=dict(color='#c8a86b', width=3),
         fill='tozeroy',
-        fillcolor='rgba(255, 215, 0, 0.12)',
+        fillcolor='rgba(200, 168, 107, 0.12)',
     ))
     
     fig.update_layout(
@@ -1773,21 +2067,21 @@ def create_energy_storage_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         xaxis_title="드로우 길이 (인치)",
         yaxis_title="저장 에너지 (J)",
         template="plotly_dark",
-        paper_bgcolor='#0d111f',
-        plot_bgcolor='#1a1f3a',
-        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        paper_bgcolor='#111317',
+        plot_bgcolor='#1a1d23',
+        font=dict(family="IBM Plex Sans, sans-serif", size=12, color="#e7e1d5"),
         height=300,
         showlegend=False,
     )
     
     fig.update_xaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     fig.update_yaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     
@@ -1807,9 +2101,9 @@ def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         y=tip_string_inner_angles,
         mode='lines',
         name='Tip-String 내각',
-        line=dict(color='#ff6b6b', width=3),
+        line=dict(color='#b8644a', width=3),
         fill='tozeroy',
-        fillcolor='rgba(255, 107, 107, 0.15)',
+        fillcolor='rgba(184, 100, 74, 0.15)',
     ))
     
     fig.update_layout(
@@ -1817,21 +2111,21 @@ def create_string_angle_chart(fdc: List[ForceCurvePoint]) -> go.Figure:
         xaxis_title="드로우 길이 (인치)",
         yaxis_title="각도 (도)",
         template="plotly_dark",
-        paper_bgcolor='#0d111f',
-        plot_bgcolor='#1a1f3a',
-        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        paper_bgcolor='#111317',
+        plot_bgcolor='#1a1d23',
+        font=dict(family="IBM Plex Sans, sans-serif", size=12, color="#e7e1d5"),
         height=400,
         showlegend=False,
     )
     
     fig.update_xaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     fig.update_yaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     
@@ -2019,6 +2313,8 @@ def _solve_limb_deformation_state(
             "tip_y_cm": float(limb_length_cm),
             "tip_bow_angle_deg": 0.0,
             "tip_string_angle_deg": 0.0,
+            "string_to_draw_angle_deg": 90.0,
+            "draw_force_gain": 0.0,
             "point_bending_deg": {},
             "mean_abs_bending_deg": 0.0,
         }
@@ -2175,6 +2471,15 @@ def _solve_limb_deformation_state(
     tip_string_angle_deg = abs(math.degrees(string_dir_rad - tip_limb_inward_rad))
     tip_string_angle_deg = abs(((tip_string_angle_deg + 180.0) % 360.0) - 180.0)
     
+    # Geometric transmission from string tension to nock draw force.
+    # F_draw,limb = T * cos(alpha)
+    # N_tip (solver load) approximates perpendicular component: N_tip = T * sin(beta)
+    # => F_draw,limb = N_tip * cos(alpha) / sin(beta)
+    string_to_draw_angle_deg = abs(math.degrees(string_dir_rad))
+    cos_alpha = abs(math.cos(string_dir_rad))
+    sin_beta = abs(math.sin(math.radians(tip_string_angle_deg)))
+    draw_force_gain = cos_alpha / max(sin_beta, MIN_TIP_STRING_SIN)
+    
     point_bending_deg: Dict[int, float] = {}
     for p in target_limb:
         point_bending_deg[p.point_id] = math.degrees(float(np.interp(p.position_cm, s_array, delta_state)))
@@ -2192,6 +2497,8 @@ def _solve_limb_deformation_state(
         "tip_y_cm": tip_y,
         "tip_bow_angle_deg": float(tip_bow_angle_deg),
         "tip_string_angle_deg": float(tip_string_angle_deg),
+        "string_to_draw_angle_deg": float(string_to_draw_angle_deg),
+        "draw_force_gain": float(draw_force_gain),
         "point_bending_deg": point_bending_deg,
         "mean_abs_bending_deg": mean_abs_bending_deg,
     }
@@ -2244,7 +2551,7 @@ def create_virtual_tiller_realistic(
     
     fig = go.Figure()
     
-    colors = ['#606060', '#808080', '#00a0d0', '#00d4ff']
+    colors = ['#66615a', '#8e877b', '#7f9f9d', '#6ea7a5']
     alphas = [0.15, 0.25, 0.45, 0.7]
     labels = ['미휨(시위 없음)', '휨(시위 걸림)', '20인치 드로우', '28인치 드로우']
     
@@ -2368,7 +2675,7 @@ def create_virtual_tiller_realistic(
             x=x_fill_upper,
             y=y_fill_upper,
             fill='toself',
-            fillcolor=f'rgba(0, 212, 255, {alphas[idx]})' if idx == len(draw_inches)-1 else f'rgba(128, 128, 128, {alphas[idx]})',
+            fillcolor=f'rgba(110, 167, 165, {alphas[idx]})' if idx == len(draw_inches)-1 else f'rgba(128, 128, 128, {alphas[idx]})',
             line=dict(width=0),
             name=f'{labels[idx]} - 상부',
             showlegend=False,
@@ -2383,7 +2690,7 @@ def create_virtual_tiller_realistic(
             x=x_fill_lower,
             y=y_fill_lower,
             fill='toself',
-            fillcolor=f'rgba(0, 212, 255, {alphas[idx]})' if idx == len(draw_inches)-1 else f'rgba(128, 128, 128, {alphas[idx]})',
+            fillcolor=f'rgba(110, 167, 165, {alphas[idx]})' if idx == len(draw_inches)-1 else f'rgba(128, 128, 128, {alphas[idx]})',
             line=dict(width=0),
             name=f'{labels[idx]} - 하부',
             showlegend=False,
@@ -2425,7 +2732,7 @@ def create_virtual_tiller_realistic(
                 string_x = [tip_upper_x, nock_x, tip_lower_x]
                 string_y = [tip_upper_y, nock_y, tip_lower_y]
                 
-                line_style = dict(color='#00d4ff', width=1.5, dash='dot')
+                line_style = dict(color='#6ea7a5', width=1.5, dash='dot')
                 
             else:
                 # Drawn state: nock point is where arrow rests (pulled back by draw length)
@@ -2437,7 +2744,7 @@ def create_virtual_tiller_realistic(
                 string_y = [tip_upper_y, nock_y, tip_lower_y]
                 
                 line_style = dict(
-                    color='#ffd700' if idx == len(draw_inches)-1 else '#999999', 
+                    color='#c8a86b' if idx == len(draw_inches)-1 else '#999999', 
                     width=2, 
                     dash='solid'
                 )
@@ -2458,7 +2765,7 @@ def create_virtual_tiller_realistic(
                     y=[nock_y],
                     mode='markers',
                     name='노크 지점',
-                    marker=dict(color='#ffd700', size=10, symbol='circle'),
+                    marker=dict(color='#c8a86b', size=10, symbol='circle'),
                     showlegend=False,
                 ))
             
@@ -2468,16 +2775,16 @@ def create_virtual_tiller_realistic(
                     type="line",
                     x0=TARGET_BRACE_HEIGHT_CM, y0=-limb_length_cm*0.3,
                     x1=TARGET_BRACE_HEIGHT_CM, y1=limb_length_cm*0.3,
-                    line=dict(color='#00d4ff', width=1, dash='dash'),
+                    line=dict(color='#6ea7a5', width=1, dash='dash'),
                 )
                 fig.add_annotation(
                     x=TARGET_BRACE_HEIGHT_CM,
                     y=limb_length_cm*0.35,
                     text=f"Brace Height<br>{TARGET_BRACE_HEIGHT_CM} cm",
                     showarrow=False,
-                    font=dict(color='#00d4ff', size=9),
-                    bgcolor='rgba(26, 31, 58, 0.8)',
-                    bordercolor='#00d4ff',
+                    font=dict(color='#6ea7a5', size=9),
+                    bgcolor='rgba(24, 28, 34, 0.82)',
+                    bordercolor='#6ea7a5',
                     borderwidth=1,
                 )
     
@@ -2487,7 +2794,7 @@ def create_virtual_tiller_realistic(
         y=[0],
         mode='markers',
         name='핸들',
-        marker=dict(color='#ff6b6b', size=12, symbol='square'),
+        marker=dict(color='#b8644a', size=12, symbol='square'),
     ))
     
     fig.update_layout(
@@ -2495,16 +2802,16 @@ def create_virtual_tiller_realistic(
         xaxis_title="수평 위치 (cm)",
         yaxis_title="수직 위치 (cm)",
         template="plotly_dark",
-        paper_bgcolor='#0d111f',
-        plot_bgcolor='#1a1f3a',
-        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        paper_bgcolor='#111317',
+        plot_bgcolor='#1a1d23',
+        font=dict(family="IBM Plex Sans, sans-serif", size=12, color="#e7e1d5"),
         height=700,
         showlegend=True,
         legend=dict(
             x=0.02,
             y=0.98,
-            bgcolor='rgba(26, 31, 58, 0.8)',
-            bordercolor='#2a3f5f',
+            bgcolor='rgba(24, 28, 34, 0.82)',
+            bordercolor='#3a3d42',
             borderwidth=1
         ),
         yaxis=dict(scaleanchor="x", scaleratio=1),  # Equal aspect ratio
@@ -2512,18 +2819,18 @@ def create_virtual_tiller_realistic(
     
     fig.update_xaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
         zeroline=True,
-        zerolinecolor='#ffd700',
+        zerolinecolor='#c8a86b',
         zerolinewidth=1,
     )
     fig.update_yaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
         zeroline=True,
-        zerolinecolor='#ffd700',
+        zerolinecolor='#c8a86b',
         zerolinewidth=1,
     )
     
@@ -2551,9 +2858,9 @@ def create_ballistics_trajectory_chart(
         y=y_max,
         mode='lines',
         name='최대 사거리 (45°)',
-        line=dict(color='#00d4ff', width=2, dash='dot'),
+        line=dict(color='#6ea7a5', width=2, dash='dot'),
         fill='tozeroy',
-        fillcolor='rgba(0, 212, 255, 0.1)',
+        fillcolor='rgba(110, 167, 165, 0.1)',
     ))
     
     # Effective range trajectory reference (35° flatter trajectory)
@@ -2579,7 +2886,7 @@ def create_ballistics_trajectory_chart(
         mode='lines',
         name='유효 사거리 기준 궤적 (35°)' if effective_range_m > 0 else '참고 궤적 (35°)',
         line=dict(
-            color='#ffd700' if effective_range_m > 0 else '#999999',
+            color='#c8a86b' if effective_range_m > 0 else '#999999',
             width=3 if effective_range_m > 0 else 2,
             dash='solid' if effective_range_m > 0 else 'dot',
         ),
@@ -2591,7 +2898,7 @@ def create_ballistics_trajectory_chart(
         y=[1.5],
         mode='markers',
         name='발사 지점',
-        marker=dict(color='#ff6b6b', size=12, symbol='triangle-right'),
+        marker=dict(color='#b8644a', size=12, symbol='triangle-right'),
     ))
     
     # Impact point (max range)
@@ -2600,7 +2907,7 @@ def create_ballistics_trajectory_chart(
         y=[0],
         mode='markers',
         name='최대 사거리 착탄',
-        marker=dict(color='#00d4ff', size=10, symbol='x'),
+        marker=dict(color='#6ea7a5', size=10, symbol='x'),
     ))
     
     # Effective range marker
@@ -2613,7 +2920,7 @@ def create_ballistics_trajectory_chart(
             y=[y_at_effective],
             mode='markers',
             name='유효 사거리 한계',
-            marker=dict(color='#ffd700', size=12, symbol='diamond'),
+            marker=dict(color='#c8a86b', size=12, symbol='diamond'),
         ))
         
         # Vertical line to target
@@ -2622,7 +2929,7 @@ def create_ballistics_trajectory_chart(
             y=[0, y_at_effective],
             mode='lines',
             name='목표물 구역',
-            line=dict(color='#ffd700', width=2, dash='dash'),
+            line=dict(color='#c8a86b', width=2, dash='dash'),
             showlegend=False,
         ))
         
@@ -2638,8 +2945,8 @@ def create_ballistics_trajectory_chart(
             y0=0,
             x1=target_x + target_width/2,
             y1=target_height,
-            line=dict(color='#ffd700', width=2),
-            fillcolor='rgba(255, 215, 0, 0.2)',
+            line=dict(color='#c8a86b', width=2),
+            fillcolor='rgba(200, 168, 107, 0.2)',
         )
         
         # Add annotation
@@ -2648,9 +2955,9 @@ def create_ballistics_trajectory_chart(
             y=target_height + 0.5,
             text="목표물",
             showarrow=False,
-            font=dict(color='#ffd700', size=10, family='monospace'),
-            bgcolor='rgba(26, 31, 58, 0.8)',
-            bordercolor='#ffd700',
+            font=dict(color='#c8a86b', size=10, family='monospace'),
+            bgcolor='rgba(24, 28, 34, 0.82)',
+            bordercolor='#c8a86b',
             borderwidth=1,
         )
     else:
@@ -2660,7 +2967,7 @@ def create_ballistics_trajectory_chart(
             text="유효 사거리 기준 미충족<br>(현재 조건에서 0 m)",
             showarrow=False,
             font=dict(color='#999999', size=10),
-            bgcolor='rgba(26, 31, 58, 0.8)',
+            bgcolor='rgba(24, 28, 34, 0.82)',
             bordercolor='#666666',
             borderwidth=1,
         )
@@ -2670,29 +2977,29 @@ def create_ballistics_trajectory_chart(
         xaxis_title="수평 거리 (m)",
         yaxis_title="높이 (m)",
         template="plotly_dark",
-        paper_bgcolor='#0d111f',
-        plot_bgcolor='#1a1f3a',
-        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        paper_bgcolor='#111317',
+        plot_bgcolor='#1a1d23',
+        font=dict(family="IBM Plex Sans, sans-serif", size=12, color="#e7e1d5"),
         height=500,
         showlegend=True,
         legend=dict(
             x=0.02,
             y=0.98,
-            bgcolor='rgba(26, 31, 58, 0.8)',
-            bordercolor='#2a3f5f',
+            bgcolor='rgba(24, 28, 34, 0.82)',
+            bordercolor='#3a3d42',
             borderwidth=1
         ),
     )
     
     fig.update_xaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
         range=[0, max(1.0, max_range_m * 1.1)],
     )
     fig.update_yaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
         range=[0, max(y_max) * 1.2] if len(y_max) > 0 else [0, 10],
     )
@@ -2714,7 +3021,7 @@ def create_geometry_profile_chart(measurements: List[MeasurementPoint]) -> go.Fi
         y=[p.width_mm for p in upper],
         mode='lines+markers',
         name='상부 림 - 너비',
-        line=dict(color='#00d4ff', width=2),
+        line=dict(color='#6ea7a5', width=2),
         marker=dict(size=8, symbol='circle'),
     ))
     
@@ -2724,7 +3031,7 @@ def create_geometry_profile_chart(measurements: List[MeasurementPoint]) -> go.Fi
         y=[p.width_mm for p in lower],
         mode='lines+markers',
         name='하부 림 - 너비',
-        line=dict(color='#00d4ff', width=2, dash='dot'),
+        line=dict(color='#6ea7a5', width=2, dash='dot'),
         marker=dict(size=8, symbol='circle-open'),
     ))
     
@@ -2734,7 +3041,7 @@ def create_geometry_profile_chart(measurements: List[MeasurementPoint]) -> go.Fi
         y=[p.thickness_mm for p in upper],
         mode='lines+markers',
         name='상부 림 - 두께',
-        line=dict(color='#ffd700', width=2),
+        line=dict(color='#c8a86b', width=2),
         marker=dict(size=8, symbol='diamond'),
     ))
     
@@ -2744,7 +3051,7 @@ def create_geometry_profile_chart(measurements: List[MeasurementPoint]) -> go.Fi
         y=[p.thickness_mm for p in lower],
         mode='lines+markers',
         name='하부 림 - 두께',
-        line=dict(color='#ffd700', width=2, dash='dot'),
+        line=dict(color='#c8a86b', width=2, dash='dot'),
         marker=dict(size=8, symbol='diamond-open'),
     ))
     
@@ -2753,28 +3060,28 @@ def create_geometry_profile_chart(measurements: List[MeasurementPoint]) -> go.Fi
         xaxis_title="핸들로부터 위치 (cm)",
         yaxis_title="치수 (mm)",
         template="plotly_dark",
-        paper_bgcolor='#0d111f',
-        plot_bgcolor='#1a1f3a',
-        font=dict(family="Inter, sans-serif", size=12, color="#E0E0E0"),
+        paper_bgcolor='#111317',
+        plot_bgcolor='#1a1d23',
+        font=dict(family="IBM Plex Sans, sans-serif", size=12, color="#e7e1d5"),
         height=500,
         showlegend=True,
         legend=dict(
             x=0.02,
             y=0.98,
-            bgcolor='rgba(26, 31, 58, 0.8)',
-            bordercolor='#2a3f5f',
+            bgcolor='rgba(24, 28, 34, 0.82)',
+            bordercolor='#3a3d42',
             borderwidth=1
         ),
     )
     
     fig.update_xaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     fig.update_yaxes(
         showgrid=True,
-        gridcolor='#2a3f5f',
+        gridcolor='#3a3d42',
         gridwidth=1,
     )
     
@@ -2905,11 +3212,8 @@ def main() -> None:
     # Apply museum dark theme
     apply_museum_dark_theme()
     
-    # Header with geometric decoration
-    st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
-    st.title("디지털 활 물리 & 탄도 연구소")
-    st.caption("박물관급 인터랙티브 연구 플랫폼 · 실험 고고학 · v4.3")
-    st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
+    # Header
+    render_hero_header()
     
     # ═══════════════════════════════════════════════════════════════════════
     # REAL-TIME INPUT COLLECTION
@@ -2946,7 +3250,12 @@ def main() -> None:
     
     # Energy & Efficiency
     stored_energy_j = calculate_stored_energy(fdc)
-    efficiency = calculate_shooting_efficiency(measurements, segment_masses_g, total_mass_g)
+    efficiency = calculate_shooting_efficiency(
+        measurements,
+        segment_masses_g,
+        total_mass_g,
+        fdc=fdc,
+    )
     arrow_speed_fps, arrow_speed_kmh = calculate_arrow_speed(stored_energy_j, efficiency)
     
     # Draw weight at 28"
@@ -2986,7 +3295,7 @@ def main() -> None:
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
     # Main charts
-    st.markdown("## 장력-드로우 분석")
+    render_section_banner("장력-드로우 분석", "Force-draw relation · Tip-string angle · Stored energy")
     
     col1, col2 = st.columns([2, 1])
     
@@ -3001,11 +3310,12 @@ def main() -> None:
         st.plotly_chart(fig_energy, use_container_width=True)
     
     st.caption("참고: FDC(장력)와 저장 에너지(U)는 물리량 단위가 다르므로 별도 그래프로 분리 표시됩니다.")
+    st.caption("참고: 발시 효율은 질량 분포 + late-draw 시위각/스태킹 손실 모델을 함께 반영합니다.")
     
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
     # Ballistics Section
-    st.markdown("## 탄도학: 궤적 및 사거리 분석")
+    render_section_banner("탄도학: 궤적 및 사거리 분석", "Trajectory envelope · Effective range modeling")
     
     col1, col2, col3 = st.columns(3)
     
@@ -3047,7 +3357,7 @@ def main() -> None:
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
     # Virtual Tiller simulation (Realistic Kinematic)
-    st.markdown("## 가상 틸러링: 활 변형 시뮬레이션")
+    render_section_banner("가상 틸러링: 활 변형 시뮬레이션", "Real-time limb deformation · Brace-constrained kinematics")
     
     # Calculate EI range for debugging info
     ei_values_upper = [p.ei_nm2 for p in measurements if p.limb in ["Upper", "Handle"]]
@@ -3072,7 +3382,7 @@ def main() -> None:
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     
     # Geometry profile
-    st.markdown("## 기하학적 프로파일")
+    render_section_banner("기하학적 프로파일", "Seven-point survey of width and thickness")
     fig_geometry = create_geometry_profile_chart(measurements)
     st.plotly_chart(fig_geometry, use_container_width=True)
     
@@ -3088,10 +3398,10 @@ def main() -> None:
     # Footer
     st.markdown('<div class="geometric-line"></div>', unsafe_allow_html=True)
     st.markdown("""
-        <div style='text-align: center; color: #808080; font-size: 0.85rem; padding: 2rem 0;'>
-            <p>디지털 실험 고고학 연구소</p>
-            <p>박물관급 인터랙티브 연구 플랫폼 © 2026</p>
-            <p style='font-style: italic; margin-top: 0.5rem;'>
+        <div style='text-align: center; color: #9a9487; font-size: 0.82rem; padding: 2.1rem 0 1.5rem 0; border-top: 1px solid #3a3d42;'>
+            <p style='letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 0.35rem;'>Digital Experimental Archaeology Laboratory</p>
+            <p style='margin: 0.15rem 0;'>Museum-grade interactive research platform © 2026</p>
+            <p style='font-style: italic; margin-top: 0.55rem; letter-spacing: 0.03em;'>
                 "고대 장인정신과 현대 계산 물리학의 융합"
             </p>
         </div>
